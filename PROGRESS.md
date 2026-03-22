@@ -55,7 +55,9 @@
   - reduction: 归约算子（sum, max, min） ✓
 - [x] 编写设计文档（docs/DESIGN_DOCUMENT.md）
 - [x] 编写README.md
+- [x] 编写团队指南（docs/TEAM_GUIDE.md）
 - [x] 功能测试（CPU模式）- 所有算子测试通过
+- [x] 推送代码到GitHub（https://github.com/ouyangyipeng/Ascend-Operator）
 
 #### 进行中
 - [ ] 在NPU环境测试算子（需要昇腾硬件）
