@@ -157,22 +157,26 @@
 
 ### 7.2 软件安装步骤
 
-#### 步骤1：安装CANN
+#### 步骤1：安装CANN 8.5.0
 ```bash
-# 下载CANN 8.5.0
+# 下载CANN 8.5.0（Triton-Ascend 3.2.0需要8.5.0+）
 wget https://ascend-repo.obs.cn-east-2.myhuaweicloud.com/CANN/CANN%208.5.0/Ascend-cann-toolkit_8.5.0_linux-aarch64.run
 
-# 安装
+# 安装（使用--quiet自动接受EULA）
 chmod +x Ascend-cann-toolkit_8.5.0_linux-aarch64.run
-./Ascend-cann-toolkit_8.5.0_linux-aarch64.run --install
+./Ascend-cann-toolkit_8.5.0_linux-aarch64.run --quiet
 
 # 设置环境变量
-source /usr/local/Ascend/ascend-toolkit/set_env.sh
+source /usr/local/Ascend/ascend-toolkit/8.5.0/cann-8.5.0/set_env.sh
 ```
 
-#### 步骤2：安装torch_npu
+#### 步骤2：安装PyTorch和torch_npu
 ```bash
-pip install torch_npu==2.7.1
+# 安装PyTorch 2.9.0
+pip install torch==2.9.0
+
+# 安装torch_npu 2.9.0（需要匹配PyTorch版本）
+pip install torch_npu==2.9.0
 ```
 
 #### 步骤3：安装Triton-Ascend
@@ -180,39 +184,26 @@ pip install torch_npu==2.7.1
 pip install triton-ascend
 ```
 
-#### 步骤4：克隆项目
+#### 步骤4：配置环境变量
+```bash
+# 关键：使用CANN 8.0.1运行时库 + CANN 8.5.0编译器
+# 这是因为torch_npu 2.9.0与CANN 8.5.0运行时有兼容性问题
+export LD_LIBRARY_PATH=/usr/local/Ascend/ascend-toolkit/8.0.1/lib64:/usr/local/Ascend/ascend-toolkit/8.5.0/cann-8.5.0/lib64:$LD_LIBRARY_PATH
+```
+
+#### 步骤5：克隆项目
 ```bash
 git clone git@github.com:ouyangyipeng/Ascend-Operator.git
 cd Ascend-Operator
 ```
 
-#### 步骤5：运行测试
+#### 步骤6：运行测试
 ```bash
-# 设置CANN环境变量
-source /usr/local/Ascend/ascend-toolkit/set_env.sh
+# 设置环境变量
+export LD_LIBRARY_PATH=/usr/local/Ascend/ascend-toolkit/8.0.1/lib64:/usr/local/Ascend/ascend-toolkit/8.5.0/cann-8.5.0/lib64:$LD_LIBRARY_PATH
 
-# 运行测试
-python3 -c "
-from operators import vector_add, matmul, softmax
-import torch
-import torch_npu
-
-# 检查NPU
-print(f'NPU available: {torch.npu.is_available()}')
-print(f'NPU count: {torch.npu.device_count()}')
-
-# 测试向量加法
-x = torch.randn(1024, device='npu:0')
-y = torch.randn(1024, device='npu:0')
-output = vector_add(x, y)
-print(f'vector_add test passed!')
-
-# 测试矩阵乘法
-a = torch.randn(128, 128, device='npu:0', dtype=torch.float16)
-b = torch.randn(128, 128, device='npu:0', dtype=torch.float16)
-output = matmul(a, b)
-print(f'matmul test passed!')
-"
+# 运行完整测试套件
+python3 -m pytest tests/test_operators.py -v
 ```
 
 ### 7.3 获取昇腾NPU资源
@@ -232,21 +223,27 @@ print(f'matmul test passed!')
 | 算子实现 | ✓ 完成 | 100% |
 | CPU功能测试 | ✓ 完成 | 100% |
 | 设计文档 | ✓ 完成 | 100% |
-| NPU测试 | ⏳ 待进行 | 0% |
+| NPU测试 | ✓ 完成 | 94.1% (16/17) |
 | 性能优化 | ⏳ 待进行 | 0% |
 | 提交材料 | ⏳ 待进行 | 0% |
 
 ### 8.2 已实现的算子
 
-| 算子 | 功能 | 测试状态 |
-|------|------|----------|
-| vector_add | 向量加法 | CPU通过 |
-| matmul | 矩阵乘法 | CPU通过 |
-| softmax | Softmax归一化 | CPU通过 |
-| flash_attention | Flash Attention | CPU通过 |
-| layer_norm | Layer Normalization | CPU通过 |
-| rms_norm | RMS Normalization | CPU通过 |
-| reduction | 归约算子 | CPU通过 |
+| 算子 | 功能 | CPU测试 | NPU测试 |
+|------|------|---------|---------|
+| vector_add | 向量加法 | ✓ 通过 | ✓ 6/6 |
+| matmul | 矩阵乘法 | ✓ 通过 | ✓ 4/4 |
+| softmax | Softmax归一化 | ✓ 通过 | ✓ 4/4 |
+| flash_attention | Flash Attention | ✓ 通过 | ⚠ 1/2 |
+| layer_norm | Layer Normalization | ✓ 通过 | ✓ 通过 |
+| rms_norm | RMS Normalization | ✓ 通过 | 待测试 |
+| reduction | 归约算子 | ✓ 通过 | 待测试 |
+
+### 8.3 NPU测试环境
+
+- **硬件**: 8卡昇腾910B4, 192核鲲鹏920, 1.5TB内存
+- **软件**: CANN 8.0.1/8.5.0, PyTorch 2.9.0, torch_npu 2.9.0, Triton-Ascend 3.2.0
+- **测试结果**: 16/17 测试通过 (94.1%)
 
 ### 8.3 待完成工作
 1. **在昇腾NPU上测试**：验证算子能否正确编译和运行

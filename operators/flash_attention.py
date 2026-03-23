@@ -71,6 +71,7 @@ def _flash_attention_kernel(
         v_offset = pid_batch * stride_vb + pid_head * stride_vh
         v_ptrs = v_ptr + v_offset + k_rows[:, None] * stride_vs + tl.arange(0, BLOCK_K)[None, :] * stride_vd
         v = tl.load(v_ptrs, mask=k_mask[:, None] & (tl.arange(0, BLOCK_K)[None, :] < head_dim), other=0.0)
+        v = v.to(tl.float32)  # 转换为fp32以匹配p的类型
         
         acc = acc * (l_i / l_new)[:, None] * tl.exp(m_i - m_new)[:, None]
         acc += tl.dot(p, v) / l_new[:, None]

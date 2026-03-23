@@ -14,13 +14,9 @@ def has_npu_driver():
         bool: 如果有可用的NPU驱动返回True，否则返回False
     """
     try:
-        import triton.runtime.driver as driver
-        # 检查是否有活跃的驱动
-        actives = driver.driver._init_drivers()
-        if len(actives) == 0:
-            return False
-        return True
-    except:
+        import torch_npu
+        return torch.npu.is_available()
+    except (ImportError, RuntimeError):
         return False
 
 
@@ -32,12 +28,7 @@ def get_device():
         str: 'npu:0' 如果有NPU，否则返回 'cpu'
     """
     if has_npu_driver():
-        try:
-            import torch_npu
-            if torch.npu.is_available():
-                return 'npu:0'
-        except ImportError:
-            pass
+        return 'npu:0'
     return 'cpu'
 
 
@@ -51,53 +42,63 @@ def get_device_properties():
     if has_npu_driver():
         try:
             import torch_npu
-            import triton.runtime.driver as driver
-            device = torch_npu.npu.current_device()
-            properties = driver.active.utils.get_device_properties(device)
-            return properties
-        except:
+            props = {
+                'name': torch.npu.get_device_name(0),
+                'capability': torch.npu.get_device_capability(0),
+                'memory': torch.npu.get_device_properties(0).total_memory,
+                'multi_processor_count': torch.npu.get_device_properties(0).multi_processor_count,
+            }
+            return props
+        except (ImportError, RuntimeError, AttributeError):
             pass
-    
-    # 返回默认属性
-    return {
-        "num_vectorcore": 1,
-        "num_aicore": 1,
-        "max_shared_mem": 192 * 1024,  # 192KB
-    }
+    return {'name': 'cpu', 'capability': None, 'memory': 0, 'multi_processor_count': 0}
 
 
-# 全局变量，避免重复检测
-_HAS_NPU = None
-_DEVICE = None
-_DEVICE_PROPERTIES = None
+# 全局变量缓存物理核数
+_num_cores = None
 
 
 def _init_globals():
     """初始化全局变量"""
-    global _HAS_NPU, _DEVICE, _DEVICE_PROPERTIES
-    if _HAS_NPU is None:
-        _HAS_NPU = has_npu_driver()
-    if _DEVICE is None:
-        _DEVICE = get_device()
-    if _DEVICE_PROPERTIES is None:
-        _DEVICE_PROPERTIES = get_device_properties()
+    global _num_cores
+    if _num_cores is not None:
+        return
+    
+    try:
+        # 尝试从系统获取物理核数
+        import os
+        # 获取物理CPU核心数
+        _num_cores = os.cpu_count() or 1
+        
+        # 尝试获取物理核数（不包括超线程）
+        try:
+            with open('/proc/cpuinfo', 'r') as f:
+                content = f.read()
+            # 统计物理处理器数量
+            processors = content.count('processor')
+            if processors > 0:
+                _num_cores = processors
+        except:
+            pass
+    except:
+        _num_cores = 1
 
 
 def get_num_cores():
     """
-    获取物理核数
+    获取CPU物理核数
     
     Returns:
-        tuple: (vector_core数量, cube_core数量)
+        int: CPU物理核数
     """
-    _init_globals()
-    props = _DEVICE_PROPERTIES
-    return props.get("num_vectorcore", 1), props.get("num_aicore", 1)
+    global _num_cores
+    if _num_cores is None:
+        _init_globals()
+    return _num_cores
 
 
 if __name__ == "__main__":
-    _init_globals()
-    print(f"Has NPU driver: {_HAS_NPU}")
-    print(f"Device: {_DEVICE}")
-    print(f"Device properties: {_DEVICE_PROPERTIES}")
-    print(f"Number of cores: {get_num_cores()}")
+    print(f"Has NPU driver: {has_npu_driver()}")
+    print(f"Device: {get_device()}")
+    print(f"Device properties: {get_device_properties()}")
+    print(f"Number of CPU cores: {get_num_cores()}")

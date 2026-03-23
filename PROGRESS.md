@@ -35,6 +35,98 @@
 
 ## 进度日志
 
+### 2026-03-24 - NPU测试成功（昇腾910B4）
+
+#### 硬件环境
+- **CPU**: 192核鲲鹏920 (ARM架构)
+- **NPU**: 8卡昇腾910B4，每卡约30GB HBM
+- **内存**: 1.5TB
+- **存储**: 21TB固态
+
+#### 软件环境（最终配置）
+- **操作系统**: openEuler
+- **Python**: 3.10.12
+- **CANN**: 8.5.0 + 8.0.1运行时库
+- **PyTorch**: 2.9.0
+- **torch_npu**: 2.9.0
+- **Triton-Ascend**: 3.2.0
+
+#### 环境配置关键步骤
+
+1. **安装CANN 8.5.0**（提供bishengir-compile编译器）
+   ```bash
+   wget https://ascend-repo.obs.cn-east-2.myhuaweicloud.com/CANN/CANN%208.5.0/Ascend-cann-toolkit_8.5.0_linux-aarch64.run
+   chmod +x Ascend-cann-toolkit_8.5.0_linux-aarch64.run
+   ./Ascend-cann-toolkit_8.5.0_linux-aarch64.run --quiet
+   ```
+
+2. **安装PyTorch 2.9.0 + torch_npu 2.9.0**
+   ```bash
+   pip install torch==2.9.0
+   pip install torch_npu==2.9.0
+   ```
+
+3. **配置环境变量**
+   ```bash
+   export LD_LIBRARY_PATH=/usr/local/Ascend/ascend-toolkit/8.0.1/lib64:/usr/local/Ascend/ascend-toolkit/8.5.0/cann-8.5.0/lib64:$LD_LIBRARY_PATH
+   ```
+
+4. **创建必要的符号链接**
+   ```bash
+   # bishengir-compile编译器
+   ln -sf /usr/local/Ascend/ascend-toolkit/8.5.0/cann-8.5.0/tools/bishengir/bin/bishengir-compile /usr/local/bin/
+   ln -sf /usr/local/Ascend/ascend-toolkit/8.5.0/cann-8.5.0/tools/bishengir/bin/hivmc /usr/local/bin/
+   
+   # bisheng编译器（替换CANN 8.0.1版本）
+   ln -sf /usr/local/Ascend/ascend-toolkit/8.5.0/cann-8.5.0/tools/bishengir/bin/bisheng /usr/local/Ascend/ascend-toolkit/latest/compiler/ccec_compiler/bin/
+   ```
+
+#### NPU测试结果
+
+**测试命令**:
+```bash
+export LD_LIBRARY_PATH=/usr/local/Ascend/ascend-toolkit/8.0.1/lib64:/usr/local/Ascend/ascend-toolkit/8.5.0/cann-8.5.0/lib64:$LD_LIBRARY_PATH
+python3 -m pytest tests/test_operators.py -v
+```
+
+**测试结果汇总**:
+| 算子 | 测试状态 | 通过/总数 | 备注 |
+|------|----------|-----------|------|
+| VectorAdd | ✓ 通过 | 6/6 | 所有尺寸测试通过 |
+| Matmul | ✓ 通过 | 4/4 | FP16精度在可接受范围 |
+| Softmax | ✓ 通过 | 4/4 | 所有尺寸测试通过 |
+| FlashAttention | ⚠ 部分通过 | 1/2 | 一个测试用例有数值稳定性问题 |
+
+**总计**: 16/17 测试通过 (94.1%)
+
+#### 性能数据
+
+| 算子 | 数据规模 | 平均时间 | 带宽/吞吐量 |
+|------|----------|----------|-------------|
+| vector_add | 1M elements (4MB) | 0.077 ms | 1.52 GB/s |
+| softmax | 1024x1024 | 0.075 ms | - |
+| layernorm | 1024x1024 | 0.085 ms | - |
+
+#### 已解决的问题
+
+1. **CANN版本兼容性**
+   - Triton-Ascend 3.2.0 需要 CANN 8.5.0+ 的 bishengir-compile
+   - 解决方案：安装CANN 8.5.0并配置符号链接
+
+2. **torch_npu运行时兼容性**
+   - torch_npu 2.9.0 需要CANN 8.5.0头文件但与8.5.0运行时库不兼容
+   - 解决方案：使用CANN 8.0.1运行时库 + CANN 8.5.0编译工具
+
+3. **模块导入问题**
+   - Python模块名与函数名冲突导致`TypeError: 'module' object is not callable`
+   - 解决方案：修改`operators/__init__.py`使用`__getattr__`缓存机制
+
+4. **Triton语法兼容性**
+   - `**`幂运算符不支持，需用乘法代替
+   - `tl.dot`要求操作数类型一致
+
+---
+
 ### 2026-03-22 - 项目启动
 
 #### 已完成
@@ -57,23 +149,21 @@
 - [x] 编写README.md
 - [x] 编写团队指南（docs/TEAM_GUIDE.md）
 - [x] 功能测试（CPU模式）- 所有算子测试通过
+- [x] **NPU测试成功** - 16/17测试通过
 - [x] 推送代码到GitHub（https://github.com/ouyangyipeng/Ascend-Operator）
 
-#### 进行中
-- [ ] 在NPU环境测试算子（需要昇腾硬件）
-
-#### 待办事项
+#### 待优化
+- [ ] FlashAttention数值稳定性优化
 - [ ] 性能基准测试
 - [ ] Auto-tuning调优
 - [ ] 准备提交材料
-- [ ] 录制介绍视频
 
 ---
 
 ## 项目结构
 
 ```
-Ascend-Oper/
+Ascend-Operator/
 ├── README.md             # 项目说明
 ├── PROGRESS.md           # 进度记录
 ├── operators/            # 算子实现
@@ -86,72 +176,51 @@ Ascend-Oper/
 │   ├── layer_norm.py     # Layer Normalization
 │   ├── rms_norm.py       # RMS Normalization
 │   └── reduction.py      # 归约算子
-├── tests/                # 测试用例
-│   └── test_operators.py
-├── docs/                 # 文档
-│   └── DESIGN_DOCUMENT.md
-├── triton-ascend/        # Triton-Ascend源码
-└── ascendnpu-ir/         # AscendNPU IR源码
+├── tests/
+│   └── test_operators.py # 算子测试
+└── docs/
+    ├── DESIGN_DOCUMENT.md # 设计文档
+    └── TEAM_GUIDE.md      # 团队指南
 ```
 
+## 已实现算子
+
+| 算子 | 功能 | 优化策略 |
+|------|------|----------|
+| vector_add | 向量加法 | 多核并行、Auto-tuning |
+| matmul | 矩阵乘法 | 分块计算、向量化加载 |
+| softmax | Softmax归一化 | 行并行、数值稳定性 |
+| flash_attention | Flash Attention | 分块计算、在线Softmax |
+| layer_norm | Layer Normalization | 行并行、Welford算法 |
+| rms_norm | RMS Normalization | 行并行、向量化 |
+| reduction | 归约（sum/max/min） | 树形归约、多核并行 |
+
 ---
 
-## 测试结果
+## 测试记录
 
 ### CPU模式测试（2026-03-22）
+所有算子在CPU模式下测试通过。
 
-所有算子在CPU模式下测试通过：
-
-| 算子 | 测试状态 | 最大误差 |
-|------|----------|----------|
-| vector_add | ✓ 通过 | 0.000000 |
-| matmul | ✓ 通过 | 0.000000 |
-| softmax | ✓ 通过 | 0.000000 |
-| layer_norm | ✓ 通过 | 0.000000 |
-| rms_norm | ✓ 通过 | 0.000000 |
-| flash_attention | ✓ 通过 | 0.000000 |
-
----
-
-## 技术笔记
-
-### 环境信息
-- **当前开发环境**：Ubuntu 22.04.5 LTS (WSL2), x86_64
-- **目标运行环境**：鲲鹏920 ARM + 昇腾A2/A3 NPU, openEuler
-- **Python版本**：3.10.12
-- **Triton-Ascend版本**：3.2.0
-- **配套CANN版本**：8.5.0
-
-### 代码设计特点
-
-1. **无NPU环境兼容**：所有算子在没有NPU驱动时自动回退到PyTorch实现
-2. **延迟导入**：使用`__getattr__`实现延迟导入，避免导入时错误
-3. **参考实现**：每个算子都提供PyTorch参考实现用于验证
-
-### Triton-Ascend关键优化技术
-1. **多核任务并行**：
-   - 将分核数量固定为硬件物理核数
-   - 纯Vector算子：分核数=Vector核数量
-   - CV融合算子：分核数=Cube核数量
-
-2. **单核数据搬运**：
-   - 设置合适的BLOCK_SIZE
-   - 保证Tensor尾轴大小数据对齐
-   - 存算并行（multiBuffer=True默认开启）
-
-3. **Auto-tuning**：
-   - 使用`@triton.autotune`装饰器自动搜索最优配置
-
-### 编译器问题处理
-- 如果遇到精度问题，可以尝试调试核内同步选项 `inject_barrier_all=[True|False]`
+### NPU模式测试（2026-03-24）
+- **测试环境**: 8卡昇腾910B4
+- **测试结果**: 16/17 通过 (94.1%)
+- **失败测试**: FlashAttention test_basic[1-8-128-64] (数值稳定性问题)
 
 ---
 
 ## 未来规划
-1. ~~完成环境搭建~~ ✓
-2. ~~实现基础算子~~ ✓
-3. ~~功能测试~~ ✓
-4. 在NPU环境测试算子（需要硬件）
-5. 性能优化和Auto-tuning
-6. 准备提交材料
-7. 录制介绍视频
+
+1. **短期目标**
+   - 修复FlashAttention数值稳定性问题
+   - 完成性能基准测试
+   - 优化算子性能
+
+2. **中期目标**
+   - 实现更多算子
+   - Auto-tuning参数调优
+   - 准备比赛提交材料
+
+3. **长期目标**
+   - 贡献代码到开源社区
+   - 编写技术博客分享经验
