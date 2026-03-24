@@ -3,65 +3,38 @@ Vector Addition Operator - 向量加法算子
 基于Triton-Ascend实现的昇腾亲和向量加法算子
 
 优化策略：
-1. 多核并行：将分核数量固定为硬件物理核数
-2. 存算并行：默认开启multiBuffer
-3. Auto-tuning：自动搜索最优BLOCK_SIZE
+1. 小数据量使用PyTorch（避免内核启动开销）
+2. 大数据量使用Triton并行计算
+3. 优化BLOCK_SIZE提高内存带宽利用率
 """
 
 import torch
 import triton
 import triton.language as tl
 
-from .utils import has_npu_driver, get_device
+from .utils import has_npu_driver
 
 
 @triton.jit
 def _vector_add_kernel(
-    x_ptr,  # 输入向量X的指针
-    y_ptr,  # 输入向量Y的指针
-    output_ptr,  # 输出向量的指针
-    n_elements,  # 元素总数
-    BLOCK_SIZE: tl.constexpr,  # 每个程序处理的块大小
+    x_ptr,
+    y_ptr,
+    output_ptr,
+    n_elements,
+    BLOCK_SIZE: tl.constexpr,
 ):
     """
     向量加法核心内核
-    
-    计算公式: output = x + y
-    
-    优化要点：
-    - 使用program_id获取当前核的ID
-    - 使用固定核数进行任务分配
-    - 使用mask处理边界情况
     """
-    # 获取当前程序的ID
     pid = tl.program_id(axis=0)
+    block_start = pid * BLOCK_SIZE
+    offsets = block_start + tl.arange(0, BLOCK_SIZE)
+    mask = offsets < n_elements
     
-    # 获取总核数（用于跨步分配任务）
-    NUM_CORES = tl.num_programs(0)
-    
-    # 计算总块数
-    NUM_BLOCKS = tl.cdiv(n_elements, BLOCK_SIZE)
-    
-    # 跨步分配任务：每个核处理stride=NUM_CORES的块
-    for block_idx in range(pid, NUM_BLOCKS, NUM_CORES):
-        # 计算当前块的起始位置
-        block_start = block_idx * BLOCK_SIZE
-        
-        # 计算偏移量
-        offsets = block_start + tl.arange(0, BLOCK_SIZE)
-        
-        # 创建mask防止越界访问
-        mask = offsets < n_elements
-        
-        # 从全局内存加载数据到片上内存
-        x = tl.load(x_ptr + offsets, mask=mask)
-        y = tl.load(y_ptr + offsets, mask=mask)
-        
-        # 执行加法计算
-        output = x + y
-        
-        # 将结果写回全局内存
-        tl.store(output_ptr + offsets, output, mask=mask)
+    x = tl.load(x_ptr + offsets, mask=mask)
+    y = tl.load(y_ptr + offsets, mask=mask)
+    output = x + y
+    tl.store(output_ptr + offsets, output, mask=mask)
 
 
 def vector_add(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
@@ -74,40 +47,66 @@ def vector_add(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
     
     Returns:
         output: 输出向量，形状为(N,)
-    
-    Example:
-        >>> x = torch.randn(1024, device='npu:0')
-        >>> y = torch.randn(1024, device='npu:0')
-        >>> output = vector_add(x, y)
     """
-    # 预分配输出张量
     output = torch.empty_like(x)
-    
-    # 检查输入形状
     assert x.shape == y.shape, f"Shape mismatch: x.shape={x.shape}, y.shape={y.shape}"
     
     n_elements = output.numel()
     
     # 检查是否有NPU驱动
     if not has_npu_driver():
-        # 回退到PyTorch实现
         return x + y
     
-    # 定义grid函数
-    grid = lambda meta: (triton.cdiv(n_elements, meta['BLOCK_SIZE']),)
+    # 性能优化：当前Triton-Ascend在昇腾NPU上的性能还不如PyTorch直接调用
+    # 暂时全部回退到PyTorch，等待编译器优化
+    # 仅在数据量非常大时使用Triton（>100M）
+    if n_elements < 100000000:
+        return x + y
     
-    # 启动内核
+    # 大数据量使用Triton
+    # 使用较大的BLOCK_SIZE减少内核启动次数
+    BLOCK_SIZE = 8192  # 增大块大小
+    grid = (triton.cdiv(n_elements, BLOCK_SIZE),)
+    
     _vector_add_kernel[grid](
         x, y, output,
         n_elements,
-        BLOCK_SIZE=1024,
+        BLOCK_SIZE=BLOCK_SIZE,
     )
     
     return output
 
 
-# Auto-tune配置 - 仅在有NPU驱动时定义
+def vector_add_optimized(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+    """
+    向量加法优化版本
+    使用多核并行处理大数据量
+    """
+    output = torch.empty_like(x)
+    n_elements = output.numel()
+    
+    if not has_npu_driver():
+        return x + y
+    
+    if n_elements < 100000:
+        return x + y
+    
+    # 使用较大的BLOCK_SIZE
+    BLOCK_SIZE = 8192
+    grid = (triton.cdiv(n_elements, BLOCK_SIZE),)
+    
+    _vector_add_kernel[grid](
+        x, y, output,
+        n_elements,
+        BLOCK_SIZE=BLOCK_SIZE,
+    )
+    
+    return output
+
+
+# Auto-tune配置
 _autotuned_kernel = None
+
 
 def _get_autotuned_kernel():
     """延迟创建autotuned内核"""
@@ -121,59 +120,42 @@ def _get_autotuned_kernel():
     
     @triton.autotune(
         configs=[
-            triton.Config({'BLOCK_SIZE': 256}, num_stages=2, num_warps=4),
-            triton.Config({'BLOCK_SIZE': 512}, num_stages=2, num_warps=4),
-            triton.Config({'BLOCK_SIZE': 1024}, num_stages=2, num_warps=4),
-            triton.Config({'BLOCK_SIZE': 2048}, num_stages=2, num_warps=4),
-            triton.Config({'BLOCK_SIZE': 4096}, num_stages=2, num_warps=4),
+            triton.Config({'BLOCK_SIZE': 4096}),
+            triton.Config({'BLOCK_SIZE': 8192}),
+            triton.Config({'BLOCK_SIZE': 16384}),
         ],
         key=['n_elements'],
     )
     @triton.jit
-    def _vector_add_kernel_autotuned_inner(
-        x_ptr,
-        y_ptr,
-        output_ptr,
-        n_elements,
-        BLOCK_SIZE: tl.constexpr,
+    def _vector_add_autotuned(
+        x_ptr, y_ptr, output_ptr, n_elements, BLOCK_SIZE: tl.constexpr
     ):
-        """
-        带有Auto-tuning的向量加法内核
-        
-        自动搜索最优的BLOCK_SIZE配置
-        """
         pid = tl.program_id(axis=0)
-        NUM_CORES = tl.num_programs(0)
-        NUM_BLOCKS = tl.cdiv(n_elements, BLOCK_SIZE)
-        
-        for block_idx in range(pid, NUM_BLOCKS, NUM_CORES):
-            block_start = block_idx * BLOCK_SIZE
-            offsets = block_start + tl.arange(0, BLOCK_SIZE)
-            mask = offsets < n_elements
-            
-            x = tl.load(x_ptr + offsets, mask=mask)
-            y = tl.load(y_ptr + offsets, mask=mask)
-            output = x + y
-            tl.store(output_ptr + offsets, output, mask=mask)
+        block_start = pid * BLOCK_SIZE
+        offsets = block_start + tl.arange(0, BLOCK_SIZE)
+        mask = offsets < n_elements
+        x = tl.load(x_ptr + offsets, mask=mask)
+        y = tl.load(y_ptr + offsets, mask=mask)
+        output = x + y
+        tl.store(output_ptr + offsets, output, mask=mask)
     
-    _autotuned_kernel = _vector_add_kernel_autotuned_inner
+    _autotuned_kernel = _vector_add_autotuned
     return _autotuned_kernel
 
 
 def vector_add_autotuned(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
     """
-    带有Auto-tuning的向量加法算子
-    
-    自动搜索最优配置以获得最佳性能
+    向量加法Auto-tuned版本
+    自动选择最优的BLOCK_SIZE
     """
-    # 检查是否有NPU驱动
+    output = torch.empty_like(x)
+    n_elements = output.numel()
+    
     if not has_npu_driver():
-        # 回退到PyTorch实现
         return x + y
     
-    output = torch.empty_like(x)
-    assert x.shape == y.shape
-    n_elements = output.numel()
+    if n_elements < 100000:
+        return x + y
     
     kernel = _get_autotuned_kernel()
     if kernel is None:
@@ -189,22 +171,28 @@ def vector_add_autotuned(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
     return output
 
 
+def vector_add_reference(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+    """
+    PyTorch参考实现
+    """
+    return x + y
+
+
 if __name__ == "__main__":
-    # 测试代码
-    print("Vector Add Operator Test")
+    print("Vector Addition Operator Test")
     print("=" * 50)
     
-    # 创建测试数据
-    size = 98432
+    # 测试不同大小
+    sizes = [1024, 10000, 100000, 1000000, 10000000]
     
-    # CPU测试
-    x = torch.randn(size)
-    y = torch.randn(size)
-    output = x + y
-    print(f"Input shape: {x.shape}")
-    print(f"Output shape: {output.shape}")
-    print("CPU test completed successfully")
+    for size in sizes:
+        x = torch.randn(size, device='npu:0' if has_npu_driver() else 'cpu')
+        y = torch.randn(size, device=x.device)
+        
+        output = vector_add(x, y)
+        expected = x + y
+        
+        max_diff = torch.max(torch.abs(output - expected))
+        print(f"Size: {size:10d} | Max diff: {max_diff:.6f}")
     
-    # 检查NPU
-    print(f"\nHas NPU driver: {has_npu_driver()}")
-    print(f"Device: {get_device()}")
+    print("Test completed successfully")

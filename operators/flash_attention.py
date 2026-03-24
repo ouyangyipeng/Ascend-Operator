@@ -6,7 +6,8 @@ Flash Attention Operator - Flash Attention算子
 1. 分块计算：将Q、K、V分块处理，减少内存访问
 2. 在线Softmax：避免存储大型注意力矩阵
 3. 多核并行：沿序列长度维度并行
-4. Auto-tuning：自动搜索最优分块参数
+4. 数值稳定性：处理边界条件和NaN问题
+5. 内存优化：使用较小的块大小避免缓冲区溢出
 """
 
 import torch
@@ -17,71 +18,98 @@ from .utils import has_npu_driver
 
 
 @triton.jit
-def _flash_attention_kernel(
+def _flash_attn_kernel(
     q_ptr, k_ptr, v_ptr, o_ptr,
-    batch_size, num_heads, seq_len, head_dim,
     stride_qb, stride_qh, stride_qs, stride_qd,
     stride_kb, stride_kh, stride_ks, stride_kd,
     stride_vb, stride_vh, stride_vs, stride_vd,
     stride_ob, stride_oh, stride_os, stride_od,
-    scale,
+    seq_len, head_dim, scale,
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
-    BLOCK_K: tl.constexpr,
+    BLOCK_D: tl.constexpr,
 ):
     """
-    Flash Attention核心内核
+    Flash Attention核心内核 - 内存优化版
     
-    计算公式: Attention(Q, K, V) = softmax(Q @ K^T / sqrt(d)) @ V
+    使用较小的块大小避免UB/CBUF溢出
     """
-    pid_batch = tl.program_id(0)
-    pid_head = tl.program_id(1)
-    pid_m = tl.program_id(2)
+    pid_b = tl.program_id(0)  # batch
+    pid_h = tl.program_id(1)  # head
+    pid_m = tl.program_id(2)  # seq block
     
-    q_offset = pid_batch * stride_qb + pid_head * stride_qh
-    q_block_start = pid_m * BLOCK_M
+    # Q块的起始行
+    q_start = pid_m * BLOCK_M
+    q_rows = q_start + tl.arange(0, BLOCK_M)
+    q_mask = q_rows < seq_len
     
     # 初始化累加器
-    acc = tl.zeros([BLOCK_M, BLOCK_K], dtype=tl.float32)
+    acc = tl.zeros([BLOCK_M, BLOCK_D], dtype=tl.float32)
     l_i = tl.zeros([BLOCK_M], dtype=tl.float32)
     m_i = tl.full([BLOCK_M], float('-inf'), dtype=tl.float32)
     
-    q_rows = q_block_start + tl.arange(0, BLOCK_M)
-    q_mask = q_rows < seq_len
-    
-    q_ptrs = q_ptr + q_offset + q_rows[:, None] * stride_qs + tl.arange(0, BLOCK_K)[None, :] * stride_qd
-    q = tl.load(q_ptrs, mask=q_mask[:, None] & (tl.arange(0, BLOCK_K)[None, :] < head_dim), other=0.0)
+    # 加载Q块
+    q_offset = pid_b * stride_qb + pid_h * stride_qh
+    q = tl.zeros([BLOCK_M, BLOCK_D], dtype=tl.float32)
+    for d_off in range(0, head_dim, BLOCK_D):
+        d_idx = d_off + tl.arange(0, BLOCK_D)
+        d_mask = d_idx < head_dim
+        q_ptrs = q_ptr + q_offset + q_rows[:, None] * stride_qs + d_idx[None, :] * stride_qd
+        q_block = tl.load(q_ptrs, mask=q_mask[:, None] & d_mask[None, :], other=0.0)
+        if d_off == 0:
+            q = q_block.to(tl.float32)
     
     # 遍历K、V块
-    for n_block_start in range(0, seq_len, BLOCK_N):
-        k_rows = n_block_start + tl.arange(0, BLOCK_N)
+    for k_start in range(0, seq_len, BLOCK_N):
+        k_rows = k_start + tl.arange(0, BLOCK_N)
         k_mask = k_rows < seq_len
         
-        k_offset = pid_batch * stride_kb + pid_head * stride_kh
-        k_ptrs = k_ptr + k_offset + k_rows[None, :] * stride_ks + tl.arange(0, BLOCK_K)[:, None] * stride_kd
-        k = tl.load(k_ptrs, mask=k_mask[None, :] & (tl.arange(0, BLOCK_K)[:, None] < head_dim), other=0.0)
+        # 加载K块
+        k_offset = pid_b * stride_kb + pid_h * stride_kh
+        k = tl.zeros([BLOCK_N, BLOCK_D], dtype=tl.float32)
+        for d_off in range(0, head_dim, BLOCK_D):
+            d_idx = d_off + tl.arange(0, BLOCK_D)
+            d_mask = d_idx < head_dim
+            k_ptrs = k_ptr + k_offset + k_rows[:, None] * stride_ks + d_idx[None, :] * stride_kd
+            k_block = tl.load(k_ptrs, mask=k_mask[:, None] & d_mask[None, :], other=0.0)
+            if d_off == 0:
+                k = k_block.to(tl.float32)
         
-        qk = tl.dot(q, k) * scale
+        # 计算QK^T
+        qk = tl.dot(q, tl.trans(k)) * scale
         
-        # 在线Softmax更新
+        # 在线Softmax
         m_new = tl.maximum(m_i, tl.max(qk, axis=1))
         p = tl.exp(qk - m_new[:, None])
         l_new = l_i * tl.exp(m_i - m_new) + tl.sum(p, axis=1)
         
-        v_offset = pid_batch * stride_vb + pid_head * stride_vh
-        v_ptrs = v_ptr + v_offset + k_rows[:, None] * stride_vs + tl.arange(0, BLOCK_K)[None, :] * stride_vd
-        v = tl.load(v_ptrs, mask=k_mask[:, None] & (tl.arange(0, BLOCK_K)[None, :] < head_dim), other=0.0)
-        v = v.to(tl.float32)  # 转换为fp32以匹配p的类型
+        # 加载V块
+        v_offset = pid_b * stride_vb + pid_h * stride_vh
+        v = tl.zeros([BLOCK_N, BLOCK_D], dtype=tl.float32)
+        for d_off in range(0, head_dim, BLOCK_D):
+            d_idx = d_off + tl.arange(0, BLOCK_D)
+            d_mask = d_idx < head_dim
+            v_ptrs = v_ptr + v_offset + k_rows[:, None] * stride_vs + d_idx[None, :] * stride_vd
+            v_block = tl.load(v_ptrs, mask=k_mask[:, None] & d_mask[None, :], other=0.0)
+            if d_off == 0:
+                v = v_block.to(tl.float32)
         
-        acc = acc * (l_i / l_new)[:, None] * tl.exp(m_i - m_new)[:, None]
-        acc += tl.dot(p, v) / l_new[:, None]
+        # 更新累加器
+        alpha = tl.exp(m_i - m_new)
+        acc = acc * alpha[:, None] + tl.dot(p, v)
         
         m_i = m_new
         l_i = l_new
     
-    o_offset = pid_batch * stride_ob + pid_head * stride_oh
-    o_ptrs = o_ptr + o_offset + q_rows[:, None] * stride_os + tl.arange(0, BLOCK_K)[None, :] * stride_od
-    tl.store(o_ptrs, acc.to(tl.float16), mask=q_mask[:, None] & (tl.arange(0, BLOCK_K)[None, :] < head_dim))
+    # 归一化并存储
+    acc = acc / l_i[:, None]
+    
+    o_offset = pid_b * stride_ob + pid_h * stride_oh
+    for d_off in range(0, head_dim, BLOCK_D):
+        d_idx = d_off + tl.arange(0, BLOCK_D)
+        d_mask = d_idx < head_dim
+        o_ptrs = o_ptr + o_offset + q_rows[:, None] * stride_os + d_idx[None, :] * stride_od
+        tl.store(o_ptrs, acc.to(tl.float16), mask=q_mask[:, None] & d_mask[None, :])
 
 
 def flash_attention(
@@ -118,23 +146,27 @@ def flash_attention(
         attn_weights = torch.softmax(scores, dim=-1)
         return torch.matmul(attn_weights, v)
     
+    # 使用较小的块大小避免内存溢出
+    BLOCK_M = 32  # 减小M块大小
+    BLOCK_N = 32  # 减小N块大小
+    BLOCK_D = min(64, head_dim)  # D块大小
+    
     grid = (
         batch_size,
         num_heads,
-        triton.cdiv(seq_len, 64),
+        triton.cdiv(seq_len, BLOCK_M),
     )
     
-    _flash_attention_kernel[grid](
+    _flash_attn_kernel[grid](
         q, k, v, output,
-        batch_size, num_heads, seq_len, head_dim,
         q.stride(0), q.stride(1), q.stride(2), q.stride(3),
         k.stride(0), k.stride(1), k.stride(2), k.stride(3),
         v.stride(0), v.stride(1), v.stride(2), v.stride(3),
         output.stride(0), output.stride(1), output.stride(2), output.stride(3),
-        scale,
-        BLOCK_M=64,
-        BLOCK_N=64,
-        BLOCK_K=32,
+        seq_len, head_dim, scale,
+        BLOCK_M=BLOCK_M,
+        BLOCK_N=BLOCK_N,
+        BLOCK_D=BLOCK_D,
     )
     
     return output
@@ -161,16 +193,27 @@ if __name__ == "__main__":
     print("Flash Attention Operator Test")
     print("=" * 50)
     
-    q = torch.randn(1, 8, 128, 64)
-    k = torch.randn(1, 8, 128, 64)
-    v = torch.randn(1, 8, 128, 64)
+    # 测试不同配置
+    configs = [
+        (1, 8, 128, 64),
+        (2, 4, 256, 32),
+        (1, 8, 512, 64),
+    ]
     
-    output = flash_attention(q, k, v)
-    expected = flash_attention_reference(q, k, v)
-    
-    print(f"Q shape: {q.shape}")
-    print(f"Output shape: {output.shape}")
-    
-    max_diff = torch.max(torch.abs(output - expected))
-    print(f"Max difference: {max_diff}")
-    print("CPU test completed successfully")
+    for batch, heads, seq_len, head_dim in configs:
+        print(f"\nTesting config: batch={batch}, heads={heads}, seq_len={seq_len}, head_dim={head_dim}")
+        
+        q = torch.randn(batch, heads, seq_len, head_dim, dtype=torch.float16, device='cpu')
+        k = torch.randn(batch, heads, seq_len, head_dim, dtype=torch.float16, device='cpu')
+        v = torch.randn(batch, heads, seq_len, head_dim, dtype=torch.float16, device='cpu')
+        
+        output = flash_attention(q, k, v)
+        expected = flash_attention_reference(q, k, v)
+        
+        max_diff = torch.max(torch.abs(output - expected))
+        print(f"Max difference: {max_diff}")
+        
+        if torch.isnan(output).any():
+            print("ERROR: Output contains NaN!")
+        else:
+            print("OK: No NaN detected")

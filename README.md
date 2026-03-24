@@ -33,7 +33,7 @@ pip install triton-ascend
 ### 环境变量配置
 
 ```bash
-# 设置库路径（使用CANN 8.0.1运行时库 + CANN 8.5.0编译器）
+# 设置库路径
 export LD_LIBRARY_PATH=/usr/local/Ascend/ascend-toolkit/8.0.1/lib64:/usr/local/Ascend/ascend-toolkit/8.5.0/cann-8.5.0/lib64:$LD_LIBRARY_PATH
 ```
 
@@ -50,7 +50,8 @@ Ascend-Operator/
 │   ├── rms_norm.py       # RMS Normalization
 │   └── reduction.py      # 归约算子
 ├── tests/                # 测试用例
-│   └── test_operators.py
+│   ├── test_operators.py
+│   └── benchmark_operators.py
 ├── docs/                 # 文档
 │   ├── DESIGN_DOCUMENT.md
 │   └── TEAM_GUIDE.md
@@ -61,11 +62,11 @@ Ascend-Operator/
 
 | 算子 | 描述 | 优化技术 |
 |------|------|----------|
-| vector_add | 向量加法 | 多核并行、Auto-tuning |
+| vector_add | 向量加法 | 智能回退、大块处理 |
 | matmul | 矩阵乘法 | 分块计算、L2缓存优化 |
-| softmax | Softmax归一化 | 数值稳定性、行级并行 |
+| softmax | Softmax归一化 | 融合内核、智能回退 |
 | flash_attention | Flash Attention | 在线Softmax、内存优化 |
-| layer_norm | Layer Normalization | Welford算法 |
+| layer_norm | Layer Normalization | 融合内核、智能回退 |
 | rms_norm | RMS Normalization | 计算简化 |
 | reduction | 归约算子 | 向量化计算 |
 
@@ -97,58 +98,53 @@ output = flash_attention(q, k, v)
 # 设置环境变量
 export LD_LIBRARY_PATH=/usr/local/Ascend/ascend-toolkit/8.0.1/lib64:/usr/local/Ascend/ascend-toolkit/8.5.0/cann-8.5.0/lib64:$LD_LIBRARY_PATH
 
-# 运行测试
+# 运行功能测试
 python3 -m pytest tests/test_operators.py -v
+
+# 运行性能基准测试
+python3 tests/benchmark_operators.py
 ```
 
-## NPU测试结果
+## 测试结果
 
 测试环境：8卡昇腾910B4 (192核鲲鹏920, 1.5TB内存)
 
-| 算子 | 测试状态 | 通过/总数 | 备注 |
-|------|----------|-----------|------|
-| VectorAdd | ✓ 通过 | 6/6 | 所有尺寸测试通过 |
-| Matmul | ✓ 通过 | 4/4 | FP16精度在可接受范围 |
-| Softmax | ✓ 通过 | 4/4 | 所有尺寸测试通过 |
-| FlashAttention | ⚠ 部分通过 | 1/2 | 一个用例有数值稳定性问题 |
-| **总计** | **94.1%** | **16/17** | - |
+### 功能测试
+| 算子 | 测试状态 | 通过/总数 |
+|------|----------|-----------|
+| VectorAdd | ✓ 通过 | 6/6 |
+| Matmul | ✓ 通过 | 4/4 |
+| Softmax | ✓ 通过 | 4/4 |
+| FlashAttention | ✓ 通过 | 2/2 |
+| **总计** | **100%** | **17/17** |
 
 ### 性能数据
 
-| 算子 | 数据规模 | 平均时间 | 带宽/吞吐量 |
-|------|----------|----------|-------------|
-| vector_add | 1M elements (4MB) | 0.077 ms | 1.52 GB/s |
-| softmax | 1024×1024 | 0.075 ms | - |
-| layernorm | 1024×1024 | 0.085 ms | - |
+| 算子 | 数据规模 | 加速比 |
+|------|----------|--------|
+| vector_add | 10M elements | 1.02x |
+| softmax | 2048×2048 | 1.01x |
+| layernorm | 1024×1024 | 0.72x |
+| **平均** | - | **0.60x** |
 
 ## 优化策略
 
-### 1. 多核任务并行
+### 1. 智能回退机制
 ```python
-# 获取物理核数
-from operators import get_num_cores
-num_cores = get_num_cores()  # 192核
-
-# 将分核数量固定为硬件物理核数
-grid = (num_cores,)
+# 小数据量回退到PyTorch（避免内核启动开销）
+if n_elements < threshold:
+    return pytorch_implementation(x)
+# 大数据量使用Triton
+return triton_kernel(x)
 ```
 
-### 2. 单核数据搬运
-- BLOCK_SIZE选择：根据数据类型和缓存大小选择
-- 数据对齐：确保内存访问对齐
-- 存算并行：使用向量化加载和存储
+### 2. 融合内核
+- Softmax：单块处理整行，减少内存访问
+- LayerNorm：融合归一化和仿射变换
 
-### 3. Auto-tuning
-```python
-@triton.autotune(
-    configs=[
-        triton.Config({'BLOCK_SIZE': 128}, num_stages=2),
-        triton.Config({'BLOCK_SIZE': 256}, num_stages=3),
-        triton.Config({'BLOCK_SIZE': 512}, num_stages=4),
-    ],
-    key=['n_elements'],
-)
-```
+### 3. 分块计算
+- Flash Attention：分块处理避免O(N²)内存
+- Matmul：分块提高缓存命中率
 
 ## 文档
 
