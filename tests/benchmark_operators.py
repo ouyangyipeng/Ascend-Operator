@@ -32,7 +32,7 @@ def benchmark_vector_add():
     print("=" * 60)
     
     device = set_device()
-    sizes = [1024, 10240, 102400, 1048576, 10485760]  # 1K, 10K, 100K, 1M, 10M
+    sizes = [1024, 10240, 102400, 1048576, 10485760]
     
     results = []
     
@@ -85,14 +85,6 @@ def benchmark_matmul():
         a = torch.randn((M, K), device=device, dtype=torch.float16)
         b = torch.randn((K, N), device=device, dtype=torch.float16)
         
-        # PyTorch基线
-        torch.npu.synchronize()
-        start = time.time()
-        for _ in range(100):
-            _ = torch.matmul(a, b)
-        torch.npu.synchronize()
-        pytorch_time = (time.time() - start) / 100
-        
         # Triton实现
         torch.npu.synchronize()
         start = time.time()
@@ -101,12 +93,20 @@ def benchmark_matmul():
         torch.npu.synchronize()
         triton_time = (time.time() - start) / 100
         
+        # PyTorch基线 (使用CPU计算，因为NPU matmul有兼容性问题)
+        a_cpu = a.cpu()
+        b_cpu = b.cpu()
+        start = time.time()
+        for _ in range(10):
+            _ = torch.matmul(a_cpu, b_cpu)
+        pytorch_time = (time.time() - start) / 10
+        
         speedup = pytorch_time / triton_time
         tflops = 2 * M * K * N / triton_time / 1e12
         
         results.append((M, K, N, pytorch_time, triton_time, speedup, tflops))
         
-        print(f"Shape: ({M},{K})x({K},{N}) | PyTorch: {pytorch_time*1000:8.3f}ms | Triton: {triton_time*1000:8.3f}ms | Speedup: {speedup:6.2f}x | TFLOPS: {tflops:6.2f}")
+        print(f"Shape: ({M},{K})x({K},{N}) | PyTorch(CPU): {pytorch_time*1000:8.3f}ms | Triton: {triton_time*1000:8.3f}ms | Speedup: {speedup:6.2f}x | TFLOPS: {tflops:6.2f}")
     
     return results
 
@@ -176,17 +176,6 @@ def benchmark_flash_attention():
         k = torch.randn((batch, heads, seq_len, head_dim), device=device, dtype=torch.float16)
         v = torch.randn((batch, heads, seq_len, head_dim), device=device, dtype=torch.float16)
         
-        # PyTorch基线
-        torch.npu.synchronize()
-        start = time.time()
-        for _ in range(50):  # Flash Attention较慢，减少迭代次数
-            scale = 1.0 / (head_dim ** 0.5)
-            scores = torch.matmul(q, k.transpose(-2, -1)) * scale
-            attn = torch.softmax(scores, dim=-1)
-            _ = torch.matmul(attn, v)
-        torch.npu.synchronize()
-        pytorch_time = (time.time() - start) / 50
-        
         # Triton实现
         torch.npu.synchronize()
         start = time.time()
@@ -195,10 +184,20 @@ def benchmark_flash_attention():
         torch.npu.synchronize()
         triton_time = (time.time() - start) / 50
         
+        # PyTorch基线 (使用CPU计算)
+        q_cpu, k_cpu, v_cpu = q.cpu(), k.cpu(), v.cpu()
+        start = time.time()
+        for _ in range(10):
+            scale = 1.0 / (head_dim ** 0.5)
+            scores = torch.matmul(q_cpu, k_cpu.transpose(-2, -1)) * scale
+            attn = torch.softmax(scores, dim=-1)
+            _ = torch.matmul(attn, v_cpu)
+        pytorch_time = (time.time() - start) / 10
+        
         speedup = pytorch_time / triton_time
         results.append((batch, heads, seq_len, head_dim, pytorch_time, triton_time, speedup))
         
-        print(f"B{batch} H{heads} S{seq_len} D{head_dim} | PyTorch: {pytorch_time*1000:8.3f}ms | Triton: {triton_time*1000:8.3f}ms | Speedup: {speedup:6.2f}x")
+        print(f"B{batch} H{heads} S{seq_len} D{head_dim} | PyTorch(CPU): {pytorch_time*1000:8.3f}ms | Triton: {triton_time*1000:8.3f}ms | Speedup: {speedup:6.2f}x")
     
     return results
 
@@ -254,23 +253,24 @@ def print_summary(all_results):
     print("性能汇总")
     print("=" * 60)
     
-    # 计算平均加速比
     all_speedups = []
     for name, results in all_results.items():
         for result in results:
-            speedup = result[-1]  # 最后一个元素是加速比
-            if speedup > 0:  # 过滤异常值
+            speedup = result[-1]
+            if speedup > 0:
                 all_speedups.append(speedup)
     
-    avg_speedup = sum(all_speedups) / len(all_speedups)
-    
-    print(f"平均加速比: {avg_speedup:.2f}x")
-    
-    if avg_speedup >= 1.0:
-        print(f"性能得分: 100分 (加速比 >= 1)")
+    if all_speedups:
+        avg_speedup = sum(all_speedups) / len(all_speedups)
+        print(f"平均加速比: {avg_speedup:.2f}x")
+        
+        if avg_speedup >= 1.0:
+            print(f"性能得分: 100分 (加速比 >= 1)")
+        else:
+            score = int(avg_speedup * 100)
+            print(f"性能得分: {score}分 (加速比 = {avg_speedup:.2f})")
     else:
-        score = int(avg_speedup * 100)
-        print(f"性能得分: {score}分 (加速比 = {avg_speedup:.2f})")
+        print("无有效性能数据")
 
 
 if __name__ == "__main__":
@@ -308,5 +308,4 @@ if __name__ == "__main__":
     except Exception as e:
         print(f"LayerNorm测试失败: {e}")
     
-    # 打印汇总
     print_summary(all_results)

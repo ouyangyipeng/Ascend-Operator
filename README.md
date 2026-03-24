@@ -51,7 +51,8 @@ Ascend-Operator/
 │   └── reduction.py      # 归约算子
 ├── tests/                # 测试用例
 │   ├── test_operators.py
-│   └── benchmark_operators.py
+│   ├── benchmark_operators.py
+│   └── quick_benchmark.py
 ├── docs/                 # 文档
 │   ├── DESIGN_DOCUMENT.md
 │   └── TEAM_GUIDE.md
@@ -62,13 +63,13 @@ Ascend-Operator/
 
 | 算子 | 描述 | 优化技术 |
 |------|------|----------|
-| vector_add | 向量加法 | 智能回退、大块处理 |
-| matmul | 矩阵乘法 | 分块计算、L2缓存优化 |
-| softmax | Softmax归一化 | 融合内核、智能回退 |
+| vector_add | 向量加法 | 多核并行、大块处理 |
+| matmul | 矩阵乘法 | 分块计算、tl.dot |
+| softmax | Softmax归一化 | 融合内核、数值稳定性 |
 | flash_attention | Flash Attention | 在线Softmax、内存优化 |
-| layer_norm | Layer Normalization | 融合内核、智能回退 |
-| rms_norm | RMS Normalization | 计算简化 |
-| reduction | 归约算子 | 向量化计算 |
+| layer_norm | Layer Normalization | 融合内核、Welford算法 |
+| rms_norm | RMS Normalization | 计算简化、向量化 |
+| reduction | 归约算子 | 分块归约、向量化计算 |
 
 ## 使用示例
 
@@ -101,8 +102,8 @@ export LD_LIBRARY_PATH=/usr/local/Ascend/ascend-toolkit/8.0.1/lib64:/usr/local/A
 # 运行功能测试
 python3 -m pytest tests/test_operators.py -v
 
-# 运行性能基准测试
-python3 tests/benchmark_operators.py
+# 运行快速性能基准测试
+python3 tests/quick_benchmark.py
 ```
 
 ## 测试结果
@@ -120,45 +121,35 @@ python3 tests/benchmark_operators.py
 
 ### 性能数据
 
-当前实现为纯Triton-Ascend实现，符合比赛规则要求。
+| 算子 | PyTorch基线 | Triton实现 | 加速比 |
+|------|-------------|------------|--------|
+| VectorAdd (1M) | 8.454ms | 21.252ms | 0.40x |
+| Softmax (1024x1024) | 0.335ms | 1.347ms | 0.25x |
+| LayerNorm (1024x1024) | 0.404ms | 1.276ms | 0.32x |
+| FlashAttention (B1H8S256D64) | 66.329ms(CPU) | 511.951ms | 0.13x |
 
-| 算子 | 优化策略 |
-|------|----------|
-| vector_add | Auto-tuning (6种配置) |
-| matmul | Auto-tuning (5种配置) |
-| softmax | 自适应块大小 |
-| layer_norm | Auto-tuning (5种配置) |
-| flash_attention | 自适应块大小 |
+**说明**: PyTorch在NPU上使用了高度优化的CANN算子库，Triton-Ascend编译器仍在发展中。
 
 ## 优化策略
 
-### 1. Auto-tuning
+### 1. 多核并行
 ```python
-@triton.autotune(
-    configs=[
-        triton.Config({'BLOCK_SIZE': 256}, num_stages=2, num_warps=4),
-        triton.Config({'BLOCK_SIZE': 512}, num_stages=3, num_warps=8),
-        # ...更多配置
-    ],
-    key=['n_elements'],
-)
-@triton.jit
-def kernel(...):
-    ...
+# 跨步分配策略
+for block_idx in range(pid, NUM_BLOCKS, NUM_CORES):
+    # 处理块
 ```
 
-### 2. 融合内核
-- Softmax：单块处理整行，减少内存访问
-- LayerNorm：融合归一化和仿射变换
-
-### 3. 分块计算
+### 2. 分块计算
 - Flash Attention：分块处理避免O(N²)内存
 - Matmul：分块提高缓存命中率
 
-### 4. 自适应配置
-- 根据输入大小动态选择最优块大小
-- 小序列使用小块增加并行度
-- 大序列使用大块减少内存访问
+### 3. 融合内核
+- Softmax：单块处理整行，减少内存访问
+- LayerNorm：融合归一化和仿射变换
+
+### 4. 数值稳定性
+- Welford算法：数值稳定的在线统计
+- 在线Softmax：避免数值溢出
 
 ## 文档
 

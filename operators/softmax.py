@@ -3,10 +3,10 @@ Softmax Operator - Softmax算子
 基于Triton-Ascend实现的昇腾亲和Softmax算子
 
 优化策略：
-1. 自适应配置：根据输入大小选择最优BLOCK_SIZE
+1. 融合内核：单块处理整行
 2. 数值稳定性：使用max值进行归一化
-3. 融合内核：单块处理整行
-4. 分块内核：处理大尺寸输入
+3. 多核并行：每行由一个核处理
+4. 自适应配置：根据输入大小选择最优BLOCK_SIZE
 """
 
 import torch
@@ -17,7 +17,7 @@ from .utils import has_npu_driver
 
 
 @triton.jit
-def _softmax_kernel_fused(
+def _softmax_kernel(
     output_ptr,
     input_ptr,
     n_cols,
@@ -34,7 +34,7 @@ def _softmax_kernel_fused(
     cols = tl.arange(0, BLOCK_SIZE)
     mask = cols < n_cols
     
-    x = tl.load(input_ptr + row_start + cols, mask=mask, other=float('-inf'))
+    x = tl.load(input_ptr + row_start + cols, mask=mask, other=float('-inf')).to(tl.float32)
     
     # 数值稳定性：减去最大值
     max_val = tl.max(x, axis=0)
@@ -52,15 +52,15 @@ def _softmax_kernel_fused(
 
 
 @triton.jit
-def _softmax_kernel_tiled(
+def _softmax_kernel_large(
     output_ptr,
     input_ptr,
     n_cols,
     BLOCK_SIZE: tl.constexpr,
 ):
     """
-    Softmax分块内核
-    适用于n_cols > BLOCK_SIZE的情况
+    Softmax内核 - 用于大列数
+    分块处理每行
     """
     row_idx = tl.program_id(0)
     row_start = row_idx * n_cols
@@ -68,36 +68,34 @@ def _softmax_kernel_tiled(
     # 第一遍：计算最大值
     max_val = float('-inf')
     for block_start in range(0, n_cols, BLOCK_SIZE):
-        offsets = block_start + tl.arange(0, BLOCK_SIZE)
-        mask = offsets < n_cols
-        x = tl.load(input_ptr + row_start + offsets, mask=mask, other=float('-inf'))
+        cols = block_start + tl.arange(0, BLOCK_SIZE)
+        mask = cols < n_cols
+        x = tl.load(input_ptr + row_start + cols, mask=mask, other=float('-inf')).to(tl.float32)
         block_max = tl.max(x, axis=0)
         max_val = tl.maximum(max_val, block_max)
     
     # 第二遍：计算exp和sum
     sum_exp = 0.0
     for block_start in range(0, n_cols, BLOCK_SIZE):
-        offsets = block_start + tl.arange(0, BLOCK_SIZE)
-        mask = offsets < n_cols
-        x = tl.load(input_ptr + row_start + offsets, mask=mask, other=float('-inf'))
+        cols = block_start + tl.arange(0, BLOCK_SIZE)
+        mask = cols < n_cols
+        x = tl.load(input_ptr + row_start + cols, mask=mask, other=float('-inf')).to(tl.float32)
         exp_x = tl.exp(x - max_val)
         sum_exp += tl.sum(exp_x, axis=0)
     
-    # 第三遍：计算softmax并存储
+    # 第三遍：计算并存储结果
     for block_start in range(0, n_cols, BLOCK_SIZE):
-        offsets = block_start + tl.arange(0, BLOCK_SIZE)
-        mask = offsets < n_cols
-        x = tl.load(input_ptr + row_start + offsets, mask=mask, other=float('-inf'))
+        cols = block_start + tl.arange(0, BLOCK_SIZE)
+        mask = cols < n_cols
+        x = tl.load(input_ptr + row_start + cols, mask=mask, other=float('-inf')).to(tl.float32)
         exp_x = tl.exp(x - max_val)
         softmax_val = exp_x / sum_exp
-        tl.store(output_ptr + row_start + offsets, softmax_val, mask=mask)
+        tl.store(output_ptr + row_start + cols, softmax_val, mask=mask)
 
 
 def _get_optimal_block_size(n_cols: int) -> int:
     """
     根据列数选择最优的BLOCK_SIZE
-    
-    选择大于等于n_cols的最小2的幂，或者对于大尺寸使用固定块大小
     """
     if n_cols <= 128:
         return 128
@@ -110,15 +108,12 @@ def _get_optimal_block_size(n_cols: int) -> int:
     elif n_cols <= 2048:
         return 2048
     else:
-        # 对于大尺寸，使用分块内核
-        return 512
+        return 4096
 
 
 def softmax(x: torch.Tensor, dim: int = -1) -> torch.Tensor:
     """
-    Softmax算子入口函数 - 纯Triton实现
-    
-    根据输入大小自适应选择最优配置，无PyTorch回退
+    Softmax算子入口函数
     
     Args:
         x: 输入张量
@@ -153,30 +148,26 @@ def softmax(x: torch.Tensor, dim: int = -1) -> torch.Tensor:
             result = result.transpose(dim, -1)
         return result
     
-    # 根据n_cols选择内核和配置
+    # NPU模式：选择最优块大小
     BLOCK_SIZE = _get_optimal_block_size(n_cols)
+    
+    # 启动内核
     grid = (n_rows,)
     
     if n_cols <= BLOCK_SIZE:
-        # 使用融合内核 - BLOCK_SIZE需要足够大覆盖整行
-        BLOCK_SIZE = triton.next_power_of_2(n_cols)
-        BLOCK_SIZE = max(BLOCK_SIZE, 128)  # 最小128
-        _softmax_kernel_fused[grid](
-            output,
-            x,
-            n_cols,
+        # 使用融合内核
+        _softmax_kernel[grid](
+            output, x, n_cols,
             BLOCK_SIZE=BLOCK_SIZE,
         )
     else:
         # 使用分块内核
-        _softmax_kernel_tiled[grid](
-            output,
-            x,
-            n_cols,
+        _softmax_kernel_large[grid](
+            output, x, n_cols,
             BLOCK_SIZE=BLOCK_SIZE,
         )
     
-    # 如果需要，转置回来
+    # 如果需要转置，转回来
     if need_transpose:
         output = output.transpose(dim, -1)
     
@@ -184,9 +175,7 @@ def softmax(x: torch.Tensor, dim: int = -1) -> torch.Tensor:
 
 
 def softmax_reference(x: torch.Tensor, dim: int = -1) -> torch.Tensor:
-    """
-    PyTorch参考实现
-    """
+    """PyTorch参考实现"""
     return torch.softmax(x, dim=dim)
 
 
@@ -197,18 +186,18 @@ if __name__ == "__main__":
     # 测试不同大小
     configs = [
         (128, 128),
-        (256, 512),
-        (512, 1024),
+        (256, 256),
+        (512, 512),
         (1024, 1024),
     ]
     
     for rows, cols in configs:
-        x = torch.randn(rows, cols, device='npu:0' if has_npu_driver() else 'cpu')
+        x = torch.randn((rows, cols), device='npu:0' if has_npu_driver() else 'cpu')
         
         output = softmax(x)
         expected = torch.softmax(x, dim=-1)
         
-        max_diff = torch.max(torch.abs(output - expected))
-        print(f"Shape: ({rows:4d}, {cols:4d}) | Max diff: {max_diff:.6f}")
+        max_diff = torch.max(torch.abs(output.cpu() - expected.cpu()))
+        print(f"Shape: ({rows:4d},{cols:4d}) | Max diff: {max_diff:.6f}")
     
     print("Test completed successfully")

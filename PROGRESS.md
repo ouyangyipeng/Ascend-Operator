@@ -35,7 +35,7 @@
 
 ## 进度日志
 
-### 2026-03-24 - 深度优化完成（纯Triton实现）
+### 2026-03-24 - 性能优化测试完成
 
 #### 硬件环境
 - **CPU**: 192核鲲鹏920 (ARM架构)
@@ -51,55 +51,65 @@
 - **torch_npu**: 2.9.0
 - **Triton-Ascend**: 3.2.0
 
-#### 优化成果
+#### 功能测试结果
+**测试命令**:
+```bash
+export LD_LIBRARY_PATH=/usr/local/Ascend/ascend-toolkit/8.0.1/lib64:/usr/local/Ascend/ascend-toolkit/8.5.0/cann-8.5.0/lib64:$LD_LIBRARY_PATH
+python3 -m pytest tests/test_operators.py -v
+```
 
-**功能测试**: 17/17 全部通过 (100%)
+**测试结果**: 17/17 全部通过 (100%)
 
-**关键改进**: 移除所有PyTorch回退，实现纯Triton-Ascend实现（符合比赛要求）
+| 算子 | 测试状态 | 通过/总数 |
+|------|----------|-----------|
+| VectorAdd | ✓ 通过 | 6/6 |
+| Matmul | ✓ 通过 | 4/4 |
+| Softmax | ✓ 通过 | 4/4 |
+| FlashAttention | ✓ 通过 | 2/2 |
+| **总计** | **100%** | **17/17** |
 
-**已实现优化**:
-1. **Auto-tuning**: vector_add, matmul 使用 `@triton.autotune` 自动搜索最优配置
-2. **自适应配置**: softmax, layer_norm, flash_attention 根据输入大小动态选择最优块大小
-3. **数值稳定性**: 所有算子添加数值稳定性处理
+#### 性能测试结果
 
-#### 优化策略
+**测试命令**:
+```bash
+python3 tests/quick_benchmark.py
+```
 
-1. **纯Triton实现**
-   - 移除所有PyTorch回退机制（符合比赛规则）
-   - 仅保留CPU模式用于开发调试
+**性能数据**:
+| 算子 | PyTorch基线 | Triton实现 | 加速比 |
+|------|-------------|------------|--------|
+| VectorAdd (1M) | 8.454ms | 21.252ms | 0.40x |
+| Softmax (1024x1024) | 0.335ms | 1.347ms | 0.25x |
+| LayerNorm (1024x1024) | 0.404ms | 1.276ms | 0.32x |
+| FlashAttention (B1H8S256D64) | 66.329ms(CPU) | 511.951ms | 0.13x |
 
-2. **Auto-tuning优化**
-   - vector_add: 6种配置 (256-8192 BLOCK_SIZE)
-   - matmul: 5种配置 (不同块大小组合)
-   - 自动选择最优配置
+**平均加速比**: 0.27x
 
-3. **自适应块大小**
-   - softmax: 根据n_cols选择128-2048的块大小
-   - layer_norm: 根据N选择最优块大小
-   - flash_attention: 根据seq_len和head_dim选择配置
+#### 性能分析
 
-4. **FlashAttention优化**
-   - 修复BLOCK_K与head_dim不匹配导致的NaN问题
-   - 使用较小的块大小避免UB/CBUF溢出
-   - 添加数值稳定性检查
+Triton实现比PyTorch基线慢的原因：
 
-#### 已解决的问题
+1. **PyTorch NPU后端优化**: PyTorch在NPU上使用了高度优化的CANN算子库，这些算子经过专业团队深度优化
 
-1. **FlashAttention NaN问题**
-   - 原因：BLOCK_K=32但head_dim=64不匹配
-   - 解决：调整块大小并添加NaN检查
+2. **内核启动开销**: Triton内核启动有固定开销，对于小规模数据影响较大
 
-2. **UB/CBUF溢出**
-   - 原因：块大小过大导致缓冲区溢出
-   - 解决：减小BLOCK_M和BLOCK_N
+3. **编译器成熟度**: Triton-Ascend编译器仍在发展中，生成的代码可能不如手写的CANN算子高效
 
-3. **Auto-tuning参数冲突**
-   - 原因：在调用内核时传递了autotune已定义的参数
-   - 解决：使用lambda grid函数或移除显式参数传递
+4. **硬件特性利用**: CANN算子充分利用了昇腾NPU的Cube和Vector单元，而Triton生成的代码可能未完全利用
 
-4. **Softmax精度问题**
-   - 原因：BLOCK_SIZE小于n_cols时融合内核处理不正确
-   - 解决：根据n_cols动态选择融合内核或分块内核
+#### 已实现的优化
+
+1. **多核并行**: 使用跨步分配策略，充分利用昇腾NPU多核
+2. **分块计算**: 减少内存访问次数，提高数据复用
+3. **融合内核**: 单块处理整行，减少内核启动次数
+4. **数值稳定性**: 使用Welford算法和在线Softmax
+
+#### 后续优化方向
+
+1. **Auto-tuning**: 实现更精细的自动调参
+2. **内存访问优化**: 优化数据对齐和向量化加载
+3. **存算并行**: 开启multiBuffer实现流水线
+4. **L2缓存优化**: 使用super-grouping策略
 
 ---
 
@@ -158,7 +168,8 @@ Ascend-Operator/
 │   └── reduction.py      # 归约算子
 ├── tests/
 │   ├── test_operators.py # 算子测试
-│   └── benchmark_operators.py # 性能基准
+│   ├── benchmark_operators.py # 性能基准
+│   └── quick_benchmark.py # 快速性能测试
 └── docs/
     ├── DESIGN_DOCUMENT.md # 设计文档
     └── TEAM_GUIDE.md      # 团队指南
@@ -168,20 +179,19 @@ Ascend-Operator/
 
 | 算子 | 功能 | 优化策略 |
 |------|------|----------|
-| vector_add | 向量加法 | 智能回退、大块处理 |
-| matmul | 矩阵乘法 | 分块计算、向量化加载 |
-| softmax | Softmax归一化 | 融合内核、智能回退 |
+| vector_add | 向量加法 | 多核并行、大块处理 |
+| matmul | 矩阵乘法 | 分块计算、tl.dot |
+| softmax | Softmax归一化 | 融合内核、数值稳定性 |
 | flash_attention | Flash Attention | 分块计算、在线Softmax |
-| layer_norm | Layer Normalization | 融合内核、智能回退 |
+| layer_norm | Layer Normalization | 融合内核、Welford算法 |
 | rms_norm | RMS Normalization | 行并行、向量化 |
-| reduction | 归约（sum/max/min） | 树形归约、多核并行 |
+| reduction | 归约（sum/max/min） | 分块归约、向量化 |
 
 ---
 
 ## 未来规划
 
 1. **短期目标**
-   - 等待Triton-Ascend编译器优化
    - 进一步优化算子性能
    - 准备比赛提交材料
 

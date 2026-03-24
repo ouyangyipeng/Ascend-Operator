@@ -49,10 +49,10 @@
 | 规则 | 状态 | 说明 |
 |------|------|------|
 | 使用TritonAscend语法 | ✓ 已遵守 | 所有算子使用`@triton.jit`装饰器 |
-| 通过AscendNPU IR编译 | ⏳ 待验证 | 需要在昇腾环境测试 |
-| 在昇腾A2/A3平台运行 | ⏳ 待验证 | 需要昇腾硬件 |
-| 功能正确通过精度检验 | ✓ 已遵守 | CPU模式测试通过 |
-| 性能超过PyTorch基线 | ⏳ 待优化 | 需要在NPU上测试性能 |
+| 通过AscendNPU IR编译 | ✓ 已验证 | 在昇腾环境测试通过 |
+| 在昇腾A2/A3平台运行 | ✓ 已验证 | 在昇腾910B4测试通过 |
+| 功能正确通过精度检验 | ✓ 已遵守 | 17/17测试通过 |
+| 性能超过PyTorch基线 | ⏳ 待优化 | 当前加速比0.27x |
 
 ### 3.2 禁止事项（未违反 ✓）
 
@@ -117,18 +117,13 @@
 ## 五、测试用例情况
 
 ### 5.1 当前测试状态
-- **初赛测试用例**：大赛尚未公布具体测试用例
-- **当前测试**：我们使用自建的测试用例进行CPU模式测试
-- **测试结果**：所有算子在CPU模式下功能正确
+- **功能测试**：17/17 全部通过 (100%)
+- **测试环境**：昇腾910B4, CANN 8.0.1/8.5.0
 
 ### 5.2 测试策略
 1. **功能测试**：与PyTorch参考实现对比，确保精度达标
 2. **边界测试**：测试不同输入尺寸
 3. **性能测试**：在NPU上测量执行时间
-
-### 5.3 后续测试计划
-- 等待大赛公布测试用例后进行针对性优化
-- 在昇腾NPU上进行实际测试
 
 ---
 
@@ -187,7 +182,6 @@ pip install triton-ascend
 #### 步骤4：配置环境变量
 ```bash
 # 关键：使用CANN 8.0.1运行时库 + CANN 8.5.0编译器
-# 这是因为torch_npu 2.9.0与CANN 8.5.0运行时有兼容性问题
 export LD_LIBRARY_PATH=/usr/local/Ascend/ascend-toolkit/8.0.1/lib64:/usr/local/Ascend/ascend-toolkit/8.5.0/cann-8.5.0/lib64:$LD_LIBRARY_PATH
 ```
 
@@ -231,11 +225,11 @@ python3 -m pytest tests/test_operators.py -v
 
 | 算子 | 功能 | CPU测试 | NPU测试 | 性能加速比 |
 |------|------|---------|---------|------------|
-| vector_add | 向量加法 | ✓ 通过 | ✓ 6/6 | 1.02x |
+| vector_add | 向量加法 | ✓ 通过 | ✓ 6/6 | 0.40x |
 | matmul | 矩阵乘法 | ✓ 通过 | ✓ 4/4 | - |
-| softmax | Softmax归一化 | ✓ 通过 | ✓ 4/4 | 1.01x |
-| flash_attention | Flash Attention | ✓ 通过 | ✓ 2/2 | - |
-| layer_norm | Layer Normalization | ✓ 通过 | ✓ 通过 | 0.72x |
+| softmax | Softmax归一化 | ✓ 通过 | ✓ 4/4 | 0.25x |
+| flash_attention | Flash Attention | ✓ 通过 | ✓ 2/2 | 0.13x |
+| layer_norm | Layer Normalization | ✓ 通过 | ✓ 通过 | 0.32x |
 | rms_norm | RMS Normalization | ✓ 通过 | 待测试 | - |
 | reduction | 归约算子 | ✓ 通过 | 待测试 | - |
 
@@ -244,7 +238,6 @@ python3 -m pytest tests/test_operators.py -v
 - **硬件**: 8卡昇腾910B4, 192核鲲鹏920, 1.5TB内存
 - **软件**: CANN 8.0.1/8.5.0, PyTorch 2.9.0, torch_npu 2.9.0, Triton-Ascend 3.2.0
 - **测试结果**: 17/17 测试通过 (100%)
-- **平均加速比**: 0.60x（从0.17x优化提升）
 
 ### 8.4 待完成工作
 1. **准备提交材料**：
@@ -287,22 +280,20 @@ x_exp = tl.exp(x - max_val)
 - Flash Attention使用在线Softmax
 - Layer Norm使用Welford算法
 
-### 9.2 待实施的优化
+### 9.2 性能分析
 
-| 优化技术 | 说明 | 优先级 |
-|----------|------|--------|
-| Auto-tuning | 自动搜索最优配置 | 高 |
-| 数据对齐 | 保证尾轴对齐 | 高 |
-| 存算并行 | 开启multiBuffer | 中 |
-| L2缓存优化 | Super-grouping | 中 |
-| 算子融合 | 融合多个算子 | 低 |
+Triton实现比PyTorch基线慢的原因：
+
+1. **PyTorch NPU后端优化**: PyTorch在NPU上使用了高度优化的CANN算子库
+2. **内核启动开销**: Triton内核启动有固定开销
+3. **编译器成熟度**: Triton-Ascend编译器仍在发展中
 
 ---
 
 ## 十、项目文件说明
 
 ```
-Ascend-Oper/
+Ascend-Operator/
 ├── README.md                 # 项目说明
 ├── PROGRESS.md               # 进度记录
 ├── operators/                # 算子实现
@@ -316,12 +307,15 @@ Ascend-Oper/
 │   ├── rms_norm.py          # RMS Normalization
 │   └── reduction.py         # 归约算子
 ├── tests/                    # 测试用例
-│   └── test_operators.py
+│   ├── test_operators.py    # 功能测试
+│   ├── benchmark_operators.py # 性能基准
+│   └── quick_benchmark.py   # 快速性能测试
 ├── docs/                     # 文档
 │   ├── TEAM_GUIDE.md        # 团队指南（本文档）
 │   └── DESIGN_DOCUMENT.md   # 设计文档
-├── triton-ascend/           # Triton-Ascend源码
-└── ascendnpu-ir/            # AscendNPU IR源码
+└── plans/                    # 优化计划
+    ├── deep_optimization_plan.md
+    └── performance_optimization_plan.md
 ```
 
 ---
@@ -350,5 +344,5 @@ A: 可以尝试调整`inject_barrier_all`选项，或记录问题反馈给组委
 
 ---
 
-*文档版本：v1.0*
-*最后更新：2026-03-22*
+*文档版本：v1.1*
+*最后更新：2026-03-24*

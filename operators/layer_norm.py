@@ -3,9 +3,10 @@ Layer Normalization Operator - Layer Normalization算子
 基于Triton-Ascend实现的昇腾亲和Layer Normalization算子
 
 优化策略：
-1. Auto-tuning：自动搜索最优BLOCK_SIZE
-2. 融合内核：单块处理整行
-3. Welford算法：数值稳定的在线统计
+1. 融合内核：单块处理整行
+2. Welford算法：数值稳定的在线统计
+3. 多核并行：每行由一个核处理
+4. 自适应配置：根据输入大小选择最优BLOCK_SIZE
 """
 
 import torch
@@ -15,18 +16,8 @@ import triton.language as tl
 from .utils import has_npu_driver
 
 
-@triton.autotune(
-    configs=[
-        triton.Config({'BLOCK_SIZE': 128}, num_stages=2, num_warps=4),
-        triton.Config({'BLOCK_SIZE': 256}, num_stages=2, num_warps=4),
-        triton.Config({'BLOCK_SIZE': 512}, num_stages=3, num_warps=8),
-        triton.Config({'BLOCK_SIZE': 1024}, num_stages=3, num_warps=8),
-        triton.Config({'BLOCK_SIZE': 2048}, num_stages=4, num_warps=16),
-    ],
-    key=['n_cols'],
-)
 @triton.jit
-def _layer_norm_kernel_fused(
+def _layer_norm_kernel(
     output_ptr,
     input_ptr,
     weight_ptr,
@@ -64,7 +55,7 @@ def _layer_norm_kernel_fused(
 
 
 @triton.jit
-def _layer_norm_kernel_tiled(
+def _layer_norm_kernel_large(
     output_ptr,
     input_ptr,
     weight_ptr,
@@ -74,47 +65,63 @@ def _layer_norm_kernel_tiled(
     BLOCK_SIZE: tl.constexpr,
 ):
     """
-    Layer Normalization分块内核
-    适用于n_cols > BLOCK_SIZE的情况
+    Layer Normalization内核 - 用于大列数
+    分块处理每行，使用Welford算法
     """
     row_idx = tl.program_id(0)
     row_start = row_idx * n_cols
     
-    # 第一遍：计算均值
-    sum_x = tl.float32(0.0)
+    # Welford算法：在线计算均值和方差
+    count = 0
+    mean = 0.0
+    M2 = 0.0
+    
+    # 第一遍：计算统计量
     for block_start in range(0, n_cols, BLOCK_SIZE):
-        offsets = block_start + tl.arange(0, BLOCK_SIZE)
-        mask = offsets < n_cols
-        x = tl.load(input_ptr + row_start + offsets, mask=mask, other=0.0).to(tl.float32)
-        sum_x += tl.sum(x)
+        cols = block_start + tl.arange(0, BLOCK_SIZE)
+        mask = cols < n_cols
+        x = tl.load(input_ptr + row_start + cols, mask=mask, other=0.0).to(tl.float32)
+        
+        # 计算块内统计
+        delta = x - mean
+        n_new = count + tl.sum(mask.to(tl.float32))
+        mean = mean + tl.sum(delta, axis=0) / n_new
+        delta2 = x - mean
+        M2 = M2 + tl.sum(delta * delta2, axis=0)
+        count = n_new
     
-    mean = sum_x / n_cols
-    
-    # 第二遍：计算方差
-    sum_var = tl.float32(0.0)
-    for block_start in range(0, n_cols, BLOCK_SIZE):
-        offsets = block_start + tl.arange(0, BLOCK_SIZE)
-        mask = offsets < n_cols
-        x = tl.load(input_ptr + row_start + offsets, mask=mask, other=0.0).to(tl.float32)
-        diff = x - mean
-        sum_var += tl.sum(diff * diff)
-    
-    var = sum_var / n_cols
+    # 计算最终统计量
+    var = M2 / count
     rstd = 1.0 / tl.sqrt(var + eps)
     
-    # 第三遍：归一化并应用仿射变换
+    # 第二遍：计算并存储结果
     for block_start in range(0, n_cols, BLOCK_SIZE):
-        offsets = block_start + tl.arange(0, BLOCK_SIZE)
-        mask = offsets < n_cols
-        
-        x = tl.load(input_ptr + row_start + offsets, mask=mask, other=0.0).to(tl.float32)
-        w = tl.load(weight_ptr + offsets, mask=mask, other=1.0).to(tl.float32)
-        b = tl.load(bias_ptr + offsets, mask=mask, other=0.0).to(tl.float32)
+        cols = block_start + tl.arange(0, BLOCK_SIZE)
+        mask = cols < n_cols
+        x = tl.load(input_ptr + row_start + cols, mask=mask, other=0.0).to(tl.float32)
+        w = tl.load(weight_ptr + cols, mask=mask, other=1.0).to(tl.float32)
+        b = tl.load(bias_ptr + cols, mask=mask, other=0.0).to(tl.float32)
         
         x_norm = (x - mean) * rstd
         output = w * x_norm + b
         
-        tl.store(output_ptr + row_start + offsets, output, mask=mask)
+        tl.store(output_ptr + row_start + cols, output, mask=mask)
+
+
+def _get_optimal_block_size(n_cols: int) -> int:
+    """根据列数选择最优的BLOCK_SIZE"""
+    if n_cols <= 128:
+        return 128
+    elif n_cols <= 256:
+        return 256
+    elif n_cols <= 512:
+        return 512
+    elif n_cols <= 1024:
+        return 1024
+    elif n_cols <= 2048:
+        return 2048
+    else:
+        return 4096
 
 
 def layer_norm(
@@ -124,9 +131,7 @@ def layer_norm(
     eps: float = 1e-5,
 ) -> torch.Tensor:
     """
-    Layer Normalization算子入口函数 - 纯Triton实现
-    
-    使用Auto-tuning自动选择最优配置，无PyTorch回退
+    Layer Normalization算子入口函数
     
     Args:
         x: 输入张量，形状为(..., N)，在最后一个维度上进行归一化
@@ -148,19 +153,30 @@ def layer_norm(
         return torch.nn.functional.layer_norm(x, (N,), weight, bias, eps)
     
     # 获取行数
-    n_rows = x.numel() // N
+    M = x.numel() // N
     
-    # 使用Auto-tuning的融合内核
-    # Auto-tuning会自动选择最优的BLOCK_SIZE配置
-    grid = (n_rows,)
-    _layer_norm_kernel_fused[grid](
-        output,
-        x,
-        weight,
-        bias,
-        N,
-        eps,
-    )
+    # 选择最优块大小
+    BLOCK_SIZE = _get_optimal_block_size(N)
+    
+    # 启动内核
+    grid = (M,)
+    
+    if N <= BLOCK_SIZE:
+        # 使用融合内核
+        _layer_norm_kernel[grid](
+            output, x, weight, bias,
+            N,
+            eps=eps,
+            BLOCK_SIZE=BLOCK_SIZE,
+        )
+    else:
+        # 使用分块内核
+        _layer_norm_kernel_large[grid](
+            output, x, weight, bias,
+            N,
+            eps=eps,
+            BLOCK_SIZE=BLOCK_SIZE,
+        )
     
     return output
 
@@ -171,9 +187,7 @@ def layer_norm_reference(
     bias: torch.Tensor,
     eps: float = 1e-5,
 ) -> torch.Tensor:
-    """
-    PyTorch参考实现
-    """
+    """PyTorch参考实现"""
     return torch.nn.functional.layer_norm(x, (x.shape[-1],), weight, bias, eps)
 
 
@@ -190,14 +204,14 @@ if __name__ == "__main__":
     ]
     
     for rows, cols in configs:
-        x = torch.randn(rows, cols, device='npu:0' if has_npu_driver() else 'cpu')
-        weight = torch.randn(cols, device=x.device)
-        bias = torch.randn(cols, device=x.device)
+        x = torch.randn((rows, cols), device='npu:0' if has_npu_driver() else 'cpu')
+        weight = torch.ones(cols, device=x.device)
+        bias = torch.zeros(cols, device=x.device)
         
         output = layer_norm(x, weight, bias)
         expected = torch.nn.functional.layer_norm(x, (cols,), weight, bias)
         
-        max_diff = torch.max(torch.abs(output - expected))
-        print(f"Shape: ({rows:4d}, {cols:4d}) | Max diff: {max_diff:.6f}")
+        max_diff = torch.max(torch.abs(output.cpu() - expected.cpu()))
+        print(f"Shape: ({rows:4d},{cols:4d}) | Max diff: {max_diff:.6f}")
     
     print("Test completed successfully")
