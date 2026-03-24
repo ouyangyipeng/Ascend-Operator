@@ -3,10 +3,9 @@ Matrix Multiplication Operator - 矩阵乘法算子
 基于Triton-Ascend实现的昇腾亲和矩阵乘法算子
 
 优化策略：
-1. 分块计算：将大矩阵分割成小块进行计算
-2. L2缓存优化：使用super-grouping提高缓存命中率
-3. 多核并行：固定核数为物理核数
-4. Auto-tuning：自动搜索最优分块参数
+1. Auto-tuning：自动搜索最优分块参数
+2. 分块计算：减少内存访问次数
+3. L2缓存优化：使用super-grouping提高缓存命中率
 """
 
 import torch
@@ -16,6 +15,16 @@ import triton.language as tl
 from .utils import has_npu_driver
 
 
+@triton.autotune(
+    configs=[
+        triton.Config({'BLOCK_SIZE_M': 32, 'BLOCK_SIZE_N': 64, 'BLOCK_SIZE_K': 32}, num_stages=2, num_warps=4),
+        triton.Config({'BLOCK_SIZE_M': 32, 'BLOCK_SIZE_N': 64, 'BLOCK_SIZE_K': 64}, num_stages=3, num_warps=4),
+        triton.Config({'BLOCK_SIZE_M': 64, 'BLOCK_SIZE_N': 64, 'BLOCK_SIZE_K': 32}, num_stages=3, num_warps=8),
+        triton.Config({'BLOCK_SIZE_M': 64, 'BLOCK_SIZE_N': 128, 'BLOCK_SIZE_K': 32}, num_stages=3, num_warps=8),
+        triton.Config({'BLOCK_SIZE_M': 128, 'BLOCK_SIZE_N': 64, 'BLOCK_SIZE_K': 32}, num_stages=3, num_warps=8),
+    ],
+    key=['M', 'N', 'K'],
+)
 @triton.jit
 def _matmul_kernel(
     # 指向矩阵的指针
@@ -118,7 +127,7 @@ def matmul(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
     
     # 检查是否有NPU驱动
     if not has_npu_driver():
-        # 回退到PyTorch实现
+        # CPU模式：回退到PyTorch（仅用于开发调试）
         return torch.matmul(a, b)
     
     # 定义grid
@@ -133,9 +142,6 @@ def matmul(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
         a.stride(0), a.stride(1),
         b.stride(0), b.stride(1),
         c.stride(0), c.stride(1),
-        BLOCK_SIZE_M=64,
-        BLOCK_SIZE_N=64,
-        BLOCK_SIZE_K=32,
         GROUP_SIZE_M=8,
     )
     
@@ -152,20 +158,25 @@ def matmul_reference(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
 
 
 if __name__ == "__main__":
-    # 测试代码
     print("Matrix Multiplication Operator Test")
     print("=" * 50)
     
-    # CPU测试
-    a = torch.randn(128, 128)
-    b = torch.randn(128, 128)
-    c = matmul(a, b)
-    print(f"Input A shape: {a.shape}")
-    print(f"Input B shape: {b.shape}")
-    print(f"Output C shape: {c.shape}")
+    # 测试不同大小
+    configs = [
+        (128, 128, 128),
+        (256, 256, 256),
+        (512, 512, 512),
+        (1024, 1024, 1024),
+    ]
     
-    # 验证
-    expected = torch.matmul(a, b)
-    max_diff = torch.max(torch.abs(c - expected))
-    print(f"Max difference: {max_diff}")
-    print("CPU test completed successfully")
+    for M, K, N in configs:
+        a = torch.randn((M, K), device='npu:0' if has_npu_driver() else 'cpu', dtype=torch.float16)
+        b = torch.randn((K, N), device=a.device, dtype=torch.float16)
+        
+        output = matmul(a, b)
+        expected = torch.matmul(a.cpu(), b.cpu()).to(a.device)
+        
+        max_diff = torch.max(torch.abs(output.cpu() - expected.cpu()))
+        print(f"Shape: ({M:4d},{K:4d})x({K:4d},{N:4d}) | Max diff: {max_diff:.6f}")
+    
+    print("Test completed successfully")

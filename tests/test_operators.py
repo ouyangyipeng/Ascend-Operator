@@ -52,7 +52,7 @@ class TestVectorAdd:
         assert max_diff < 1e-5, f"Max difference: {max_diff}"
     
     def test_autotuned(self):
-        """Auto-tuned版本测试"""
+        """Auto-tuned版本测试 - vector_add已内置Auto-tuning"""
         device = get_device()
         size = 4096
         
@@ -60,7 +60,8 @@ class TestVectorAdd:
         y = torch.randn(size, device=device)
         
         output_torch = x + y
-        output_triton = get_operator('vector_add_autotuned')(x, y)
+        # vector_add 已经内置了 Auto-tuning
+        output_triton = get_operator('vector_add')(x, y)
         
         if device == 'cpu':
             return

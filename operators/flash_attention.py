@@ -8,6 +8,7 @@ Flash Attention Operator - Flash Attention算子
 3. 多核并行：沿序列长度维度并行
 4. 数值稳定性：处理边界条件和NaN问题
 5. 内存优化：使用较小的块大小避免缓冲区溢出
+6. 自适应配置：根据输入大小选择最优块配置
 """
 
 import torch
@@ -112,6 +113,35 @@ def _flash_attn_kernel(
         tl.store(o_ptrs, acc.to(tl.float16), mask=q_mask[:, None] & d_mask[None, :])
 
 
+def _get_optimal_config(seq_len: int, head_dim: int) -> tuple:
+    """
+    根据输入大小选择最优配置
+    
+    Returns:
+        (BLOCK_M, BLOCK_N, BLOCK_D, num_stages, num_warps)
+    """
+    # 小序列长度 - 使用小块大小增加并行度
+    if seq_len <= 128:
+        if head_dim <= 32:
+            return (32, 32, 32, 2, 4)
+        else:
+            return (32, 32, 64, 2, 4)
+    
+    # 中等序列长度
+    elif seq_len <= 512:
+        if head_dim <= 32:
+            return (64, 64, 32, 3, 8)
+        else:
+            return (32, 64, 64, 3, 4)
+    
+    # 大序列长度 - 使用更大的块大小
+    else:
+        if head_dim <= 32:
+            return (128, 64, 32, 4, 8)
+        else:
+            return (64, 128, 64, 4, 8)
+
+
 def flash_attention(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -119,7 +149,9 @@ def flash_attention(
     scale: float = None,
 ) -> torch.Tensor:
     """
-    Flash Attention算子入口函数
+    Flash Attention算子入口函数 - 纯Triton实现
+    
+    根据输入大小自适应选择最优配置，无PyTorch回退
     
     Args:
         q: Query张量，形状为(batch, num_heads, seq_len, head_dim)
@@ -139,17 +171,15 @@ def flash_attention(
     
     output = torch.empty_like(q)
     
-    # 检查是否有NPU驱动
+    # CPU模式：仅用于开发调试
     if not has_npu_driver():
-        # 回退到PyTorch实现
-        scores = torch.matmul(q, k.transpose(-2, -1)) * scale
-        attn_weights = torch.softmax(scores, dim=-1)
-        return torch.matmul(attn_weights, v)
-    
-    # 使用较小的块大小避免内存溢出
-    BLOCK_M = 32  # 减小M块大小
-    BLOCK_N = 32  # 减小N块大小
-    BLOCK_D = min(64, head_dim)  # D块大小
+        # 使用默认配置
+        BLOCK_M = 32
+        BLOCK_N = 32
+        BLOCK_D = min(64, head_dim)
+    else:
+        # NPU模式：根据输入大小选择最优配置
+        BLOCK_M, BLOCK_N, BLOCK_D, _, _ = _get_optimal_config(seq_len, head_dim)
     
     grid = (
         batch_size,

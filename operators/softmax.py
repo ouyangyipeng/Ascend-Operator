@@ -3,9 +3,10 @@ Softmax Operator - Softmax算子
 基于Triton-Ascend实现的昇腾亲和Softmax算子
 
 优化策略：
-1. 单块处理整行（当n_cols较小时）
+1. 自适应配置：根据输入大小选择最优BLOCK_SIZE
 2. 数值稳定性：使用max值进行归一化
-3. 小数据量使用PyTorch
+3. 融合内核：单块处理整行
+4. 分块内核：处理大尺寸输入
 """
 
 import torch
@@ -92,9 +93,32 @@ def _softmax_kernel_tiled(
         tl.store(output_ptr + row_start + offsets, softmax_val, mask=mask)
 
 
+def _get_optimal_block_size(n_cols: int) -> int:
+    """
+    根据列数选择最优的BLOCK_SIZE
+    
+    选择大于等于n_cols的最小2的幂，或者对于大尺寸使用固定块大小
+    """
+    if n_cols <= 128:
+        return 128
+    elif n_cols <= 256:
+        return 256
+    elif n_cols <= 512:
+        return 512
+    elif n_cols <= 1024:
+        return 1024
+    elif n_cols <= 2048:
+        return 2048
+    else:
+        # 对于大尺寸，使用分块内核
+        return 512
+
+
 def softmax(x: torch.Tensor, dim: int = -1) -> torch.Tensor:
     """
-    Softmax算子入口函数
+    Softmax算子入口函数 - 纯Triton实现
+    
+    根据输入大小自适应选择最优配置，无PyTorch回退
     
     Args:
         x: 输入张量
@@ -122,26 +146,21 @@ def softmax(x: torch.Tensor, dim: int = -1) -> torch.Tensor:
     # 预分配输出
     output = torch.empty_like(x)
     
-    # 检查是否有NPU驱动
+    # CPU模式：仅用于开发调试
     if not has_npu_driver():
         result = torch.softmax(x, dim=-1)
         if need_transpose:
             result = result.transpose(dim, -1)
         return result
     
-    # 当前Triton-Ascend在昇腾NPU上的性能还不如PyTorch直接调用
-    # 暂时全部回退到PyTorch，等待编译器优化
-    if n_rows * n_cols < 10000000:
-        result = torch.softmax(x, dim=-1)
-        if need_transpose:
-            result = result.transpose(dim, -1)
-        return result
+    # 根据n_cols选择内核和配置
+    BLOCK_SIZE = _get_optimal_block_size(n_cols)
+    grid = (n_rows,)
     
-    # 根据n_cols选择内核
-    if n_cols <= 1024:
-        # 使用融合内核
+    if n_cols <= BLOCK_SIZE:
+        # 使用融合内核 - BLOCK_SIZE需要足够大覆盖整行
         BLOCK_SIZE = triton.next_power_of_2(n_cols)
-        grid = (n_rows,)
+        BLOCK_SIZE = max(BLOCK_SIZE, 128)  # 最小128
         _softmax_kernel_fused[grid](
             output,
             x,
@@ -150,8 +169,6 @@ def softmax(x: torch.Tensor, dim: int = -1) -> torch.Tensor:
         )
     else:
         # 使用分块内核
-        BLOCK_SIZE = 256
-        grid = (n_rows,)
         _softmax_kernel_tiled[grid](
             output,
             x,

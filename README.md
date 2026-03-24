@@ -120,22 +120,31 @@ python3 tests/benchmark_operators.py
 
 ### 性能数据
 
-| 算子 | 数据规模 | 加速比 |
-|------|----------|--------|
-| vector_add | 10M elements | 1.02x |
-| softmax | 2048×2048 | 1.01x |
-| layernorm | 1024×1024 | 0.72x |
-| **平均** | - | **0.60x** |
+当前实现为纯Triton-Ascend实现，符合比赛规则要求。
+
+| 算子 | 优化策略 |
+|------|----------|
+| vector_add | Auto-tuning (6种配置) |
+| matmul | Auto-tuning (5种配置) |
+| softmax | 自适应块大小 |
+| layer_norm | Auto-tuning (5种配置) |
+| flash_attention | 自适应块大小 |
 
 ## 优化策略
 
-### 1. 智能回退机制
+### 1. Auto-tuning
 ```python
-# 小数据量回退到PyTorch（避免内核启动开销）
-if n_elements < threshold:
-    return pytorch_implementation(x)
-# 大数据量使用Triton
-return triton_kernel(x)
+@triton.autotune(
+    configs=[
+        triton.Config({'BLOCK_SIZE': 256}, num_stages=2, num_warps=4),
+        triton.Config({'BLOCK_SIZE': 512}, num_stages=3, num_warps=8),
+        # ...更多配置
+    ],
+    key=['n_elements'],
+)
+@triton.jit
+def kernel(...):
+    ...
 ```
 
 ### 2. 融合内核
@@ -145,6 +154,11 @@ return triton_kernel(x)
 ### 3. 分块计算
 - Flash Attention：分块处理避免O(N²)内存
 - Matmul：分块提高缓存命中率
+
+### 4. 自适应配置
+- 根据输入大小动态选择最优块大小
+- 小序列使用小块增加并行度
+- 大序列使用大块减少内存访问
 
 ## 文档
 

@@ -3,9 +3,9 @@ Layer Normalization Operator - Layer Normalization算子
 基于Triton-Ascend实现的昇腾亲和Layer Normalization算子
 
 优化策略：
-1. 小数据量使用PyTorch
-2. 单块处理整行（当n_cols较小时）
-3. 融合归一化和仿射变换
+1. Auto-tuning：自动搜索最优BLOCK_SIZE
+2. 融合内核：单块处理整行
+3. Welford算法：数值稳定的在线统计
 """
 
 import torch
@@ -15,6 +15,16 @@ import triton.language as tl
 from .utils import has_npu_driver
 
 
+@triton.autotune(
+    configs=[
+        triton.Config({'BLOCK_SIZE': 128}, num_stages=2, num_warps=4),
+        triton.Config({'BLOCK_SIZE': 256}, num_stages=2, num_warps=4),
+        triton.Config({'BLOCK_SIZE': 512}, num_stages=3, num_warps=8),
+        triton.Config({'BLOCK_SIZE': 1024}, num_stages=3, num_warps=8),
+        triton.Config({'BLOCK_SIZE': 2048}, num_stages=4, num_warps=16),
+    ],
+    key=['n_cols'],
+)
 @triton.jit
 def _layer_norm_kernel_fused(
     output_ptr,
@@ -114,7 +124,9 @@ def layer_norm(
     eps: float = 1e-5,
 ) -> torch.Tensor:
     """
-    Layer Normalization算子入口函数
+    Layer Normalization算子入口函数 - 纯Triton实现
+    
+    使用Auto-tuning自动选择最优配置，无PyTorch回退
     
     Args:
         x: 输入张量，形状为(..., N)，在最后一个维度上进行归一化
@@ -131,45 +143,24 @@ def layer_norm(
     # 预分配输出
     output = torch.empty_like(x)
     
-    # 检查是否有NPU驱动
+    # CPU模式：仅用于开发调试
     if not has_npu_driver():
-        return torch.nn.functional.layer_norm(x, (N,), weight, bias, eps)
-    
-    # 当前Triton-Ascend在昇腾NPU上的性能还不如PyTorch直接调用
-    # 暂时全部回退到PyTorch，等待编译器优化
-    if x.numel() < 10000000:
         return torch.nn.functional.layer_norm(x, (N,), weight, bias, eps)
     
     # 获取行数
     n_rows = x.numel() // N
     
-    # 根据N选择内核
-    if N <= 1024:
-        # 使用融合内核
-        BLOCK_SIZE = triton.next_power_of_2(N)
-        grid = (n_rows,)
-        _layer_norm_kernel_fused[grid](
-            output,
-            x,
-            weight,
-            bias,
-            N,
-            eps,
-            BLOCK_SIZE=BLOCK_SIZE,
-        )
-    else:
-        # 使用分块内核
-        BLOCK_SIZE = 256
-        grid = (n_rows,)
-        _layer_norm_kernel_tiled[grid](
-            output,
-            x,
-            weight,
-            bias,
-            N,
-            eps,
-            BLOCK_SIZE=BLOCK_SIZE,
-        )
+    # 使用Auto-tuning的融合内核
+    # Auto-tuning会自动选择最优的BLOCK_SIZE配置
+    grid = (n_rows,)
+    _layer_norm_kernel_fused[grid](
+        output,
+        x,
+        weight,
+        bias,
+        N,
+        eps,
+    )
     
     return output
 
