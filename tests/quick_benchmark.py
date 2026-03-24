@@ -29,6 +29,12 @@ def quick_benchmark():
     x = torch.randn(size, device=device)
     y = torch.randn(size, device=device)
     
+    # 预热Triton内核
+    for _ in range(3):
+        _ = operators.vector_add(x, y)
+    torch.npu.synchronize()
+    
+    # PyTorch基线
     torch.npu.synchronize()
     start = time.time()
     for _ in range(10):
@@ -36,6 +42,7 @@ def quick_benchmark():
     torch.npu.synchronize()
     pytorch_time = (time.time() - start) / 10
     
+    # Triton测试
     torch.npu.synchronize()
     start = time.time()
     for _ in range(10):
@@ -50,6 +57,11 @@ def quick_benchmark():
     # Softmax
     print("\n[Softmax]")
     x = torch.randn((1024, 1024), device=device)
+    
+    # 预热
+    for _ in range(3):
+        _ = operators.softmax(x)
+    torch.npu.synchronize()
     
     torch.npu.synchronize()
     start = time.time()
@@ -75,6 +87,11 @@ def quick_benchmark():
     weight = torch.randn(1024, device=device)
     bias = torch.randn(1024, device=device)
     
+    # 预热
+    for _ in range(3):
+        _ = operators.layer_norm(x, weight, bias)
+    torch.npu.synchronize()
+    
     torch.npu.synchronize()
     start = time.time()
     for _ in range(10):
@@ -98,6 +115,11 @@ def quick_benchmark():
     q = torch.randn((1, 8, 256, 64), device=device, dtype=torch.float16)
     k = torch.randn((1, 8, 256, 64), device=device, dtype=torch.float16)
     v = torch.randn((1, 8, 256, 64), device=device, dtype=torch.float16)
+    
+    # 预热
+    for _ in range(3):
+        _ = operators.flash_attention(q, k, v)
+    torch.npu.synchronize()
     
     torch.npu.synchronize()
     start = time.time()

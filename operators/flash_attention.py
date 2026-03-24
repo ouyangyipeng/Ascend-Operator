@@ -5,8 +5,9 @@ Flash Attention Operator - Flash Attention算子
 优化策略：
 1. 分块计算：将Q、K、V分块处理，减少内存访问
 2. 在线Softmax：避免存储大型注意力矩阵
-3. 多核并行：沿序列长度维度并行
-4. 数值稳定性：处理边界条件和NaN问题
+3. 多核并行：沿batch和head维度并行
+4. 使用tl.dot：让编译器生成Cube矩阵计算指令
+5. 优化分块大小：避免UB/CBUF溢出
 """
 
 import torch
@@ -14,6 +15,10 @@ import triton
 import triton.language as tl
 
 from .utils import has_npu_driver
+
+
+# Ascend 910B4 每个芯片有32个AI Core
+NUM_AI_CORES = 32
 
 
 @triton.jit
@@ -29,8 +34,10 @@ def _flash_attn_kernel(
     BLOCK_D: tl.constexpr,
 ):
     """
-    Flash Attention核心内核 - 简化版本
-    使用在线Softmax算法
+    Flash Attention核心内核 - 优化版本
+    
+    使用在线Softmax算法，避免存储大型注意力矩阵
+    使用tl.dot进行矩阵乘法，让编译器生成Cube指令
     """
     pid_b = tl.program_id(0)  # batch
     pid_h = tl.program_id(1)  # head
@@ -61,32 +68,38 @@ def _flash_attn_kernel(
         k_ptrs = k_ptr + k_offset + k_rows[:, None] * stride_ks + tl.arange(0, BLOCK_D)[None, :] * stride_kd
         k = tl.load(k_ptrs, mask=k_mask[:, None], other=0.0).to(tl.float32)
         
-        # 计算QK^T
+        # 计算QK^T - 使用tl.dot让编译器生成Cube指令
         qk = tl.dot(q, tl.trans(k)) * scale
         
-        # 在线Softmax
+        # 处理无效位置（设置为-inf）
+        qk = tl.where(q_mask[:, None] & k_mask[None, :], qk, float('-inf'))
+        
+        # 在线Softmax更新
         m_new = tl.maximum(m_i, tl.max(qk, axis=1))
-        p = tl.exp(qk - m_new[:, None])
-        l_new = l_i * tl.exp(m_i - m_new) + tl.sum(p, axis=1)
+        
+        # 防止数值问题：当m_new为-inf时，exp会出问题
+        # 使用safe_exp：当m_new为-inf时，alpha为0
+        alpha = tl.where(m_i > float('-inf'), tl.exp(m_i - m_new), 0.0)
+        p = tl.where(q_mask[:, None] & k_mask[None, :], tl.exp(qk - m_new[:, None]), 0.0)
         
         # 加载V块
         v_offset = pid_b * stride_vb + pid_h * stride_vh
         v_ptrs = v_ptr + v_offset + k_rows[:, None] * stride_vs + tl.arange(0, BLOCK_D)[None, :] * stride_vd
         v = tl.load(v_ptrs, mask=k_mask[:, None], other=0.0).to(tl.float32)
         
-        # 更新累加器
-        alpha = tl.exp(m_i - m_new)
-        acc = acc * alpha[:, None] + tl.dot(p, v)
-        
+        # 更新累加器 - 使用tl.dot
+        acc = acc * alpha[:, None] + tl.dot(p.to(tl.float32), v)
+        l_i = l_i * alpha + tl.sum(p, axis=1)
         m_i = m_new
-        l_i = l_new
     
     # 归一化并存储
+    # 防止除以0
+    l_i = tl.where(l_i > 0, l_i, 1.0)
     acc = acc / l_i[:, None]
     
     o_offset = pid_b * stride_ob + pid_h * stride_oh
     o_ptrs = o_ptr + o_offset + q_rows[:, None] * stride_os + tl.arange(0, BLOCK_D)[None, :] * stride_od
-    tl.store(o_ptrs, acc.to(tl.float16), mask=q_mask[:, None])
+    tl.store(o_ptrs, acc, mask=q_mask[:, None])
 
 
 def flash_attention(
@@ -123,27 +136,40 @@ def flash_attention(
         attn = torch.softmax(scores, dim=-1)
         return torch.matmul(attn, v)
     
-    # NPU模式：选择合适的块大小
-    # 根据head_dim选择BLOCK_D
-    BLOCK_D = min(64, head_dim)
+    # NPU模式：根据输入大小选择最优配置
+    # BLOCK_D需要能整除head_dim
+    if head_dim <= 32:
+        BLOCK_D = 32
+    elif head_dim <= 64:
+        BLOCK_D = 64
+    elif head_dim <= 128:
+        BLOCK_D = 128
+    else:
+        BLOCK_D = 64  # 默认使用较小的块
     
     # 根据seq_len选择BLOCK_M和BLOCK_N
-    if seq_len <= 128:
-        BLOCK_M = 16
-        BLOCK_N = 16
+    if seq_len <= 64:
+        BLOCK_M = min(64, seq_len)
+        BLOCK_N = min(64, seq_len)
+    elif seq_len <= 128:
+        BLOCK_M = min(64, seq_len)
+        BLOCK_N = min(64, seq_len)
     elif seq_len <= 256:
-        BLOCK_M = 32
+        BLOCK_M = 64
         BLOCK_N = 32
-    else:
+    elif seq_len <= 512:
         BLOCK_M = 64
         BLOCK_N = 64
+    else:
+        BLOCK_M = 32
+        BLOCK_N = 32
     
+    # 标准内核
     grid = (
         batch_size,
         num_heads,
         triton.cdiv(seq_len, BLOCK_M),
     )
-    
     _flash_attn_kernel[grid](
         q, k, v, output,
         q.stride(0), q.stride(1), q.stride(2), q.stride(3),
@@ -179,8 +205,10 @@ if __name__ == "__main__":
     
     # 测试不同大小
     configs = [
+        (1, 8, 64, 64),
         (1, 8, 128, 64),
         (2, 4, 256, 32),
+        (1, 8, 512, 64),
     ]
     
     for batch, heads, seq_len, head_dim in configs:
